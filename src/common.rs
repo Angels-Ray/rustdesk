@@ -64,6 +64,80 @@ pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
+const DEFAULT_UDP_PORT_READY_MIN_MS: u64 = 250;
+const DEFAULT_UDP_PORT_READY_MAX_MS: u64 = 1200;
+const UDP_PORT_READY_ABS_MIN_MS: u64 = 50;
+const UDP_PORT_READY_ABS_MAX_MS: u64 = 5000;
+const DEFAULT_P2P_DIRECT_BUDGET_MS: u64 = 8000;
+const P2P_DIRECT_BUDGET_MIN_MS: u64 = 1000;
+const P2P_DIRECT_BUDGET_MAX_MS: u64 = 60000;
+const DEFAULT_P2P_RELAY_COMMIT_DEADLINE_MS: u64 = 1800;
+const P2P_RELAY_COMMIT_DEADLINE_MIN_MS: u64 = 200;
+const P2P_RELAY_COMMIT_DEADLINE_MAX_MS: u64 = 10000;
+const DEFAULT_P2P_UDP_BUDGET_PACKETS: u64 = 32;
+const P2P_UDP_BUDGET_PACKETS_MIN: u64 = 4;
+const P2P_UDP_BUDGET_PACKETS_MAX: u64 = 256;
+const DEFAULT_P2P_EASYSYM_WINDOW: u64 = 7;
+const P2P_EASYSYM_WINDOW_MIN: u64 = 1;
+const P2P_EASYSYM_WINDOW_MAX: u64 = 32;
+const DEFAULT_P2P_HARDSYM_FAST_FALLBACK_MS: u64 = 300;
+const P2P_HARDSYM_FAST_FALLBACK_MIN_MS: u64 = 100;
+const P2P_HARDSYM_FAST_FALLBACK_MAX_MS: u64 = 5000;
+const DEFAULT_P2P_PATH_CACHE_TTL_SEC: u64 = 60;
+const P2P_PATH_CACHE_TTL_MIN_SEC: u64 = 5;
+const P2P_PATH_CACHE_TTL_MAX_SEC: u64 = 3600;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatClassLocal {
+    Unknown,
+    Cone,
+    EasySymInc,
+    EasySymDec,
+    HardSym,
+}
+
+impl NatClassLocal {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NatClassLocal::Unknown => "unknown",
+            NatClassLocal::Cone => "cone",
+            NatClassLocal::EasySymInc => "easy_sym_inc",
+            NatClassLocal::EasySymDec => "easy_sym_dec",
+            NatClassLocal::HardSym => "hard_sym",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct NatProfile {
+    pub class_local: NatClassLocal,
+    pub mapped_ip_count: u8,
+    pub mapped_port_span: u16,
+    pub mapping_varies_by_dest: bool,
+    pub port_trend: i8,
+    pub port_stability: f32,
+    pub udp_reachability: f32,
+    pub ipv6_ready: bool,
+    pub confidence: f32,
+    pub sampled_at_unix_ms: i64,
+}
+
+impl Default for NatProfile {
+    fn default() -> Self {
+        Self {
+            class_local: NatClassLocal::Unknown,
+            mapped_ip_count: 0,
+            mapped_port_span: 0,
+            mapping_varies_by_dest: false,
+            port_trend: 0,
+            port_stability: 0.0,
+            udp_reachability: 0.0,
+            ipv6_ready: false,
+            confidence: 0.0,
+            sampled_at_unix_ms: 0,
+        }
+    }
+}
 
 pub mod input {
     pub const MOUSE_TYPE_MOVE: i32 = 0;
@@ -97,6 +171,7 @@ lazy_static::lazy_static! {
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
+    static ref NAT_PROFILE: Arc<RwLock<NatProfile>> = Default::default();
 }
 
 lazy_static::lazy_static! {
@@ -563,6 +638,65 @@ pub struct CheckTestNatType {
     is_direct: bool,
 }
 
+#[inline]
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map(|x| x.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+pub fn emit_p2p_event(event: &str, payload: Value) {
+    log::info!("event.p2p.{event} {}", payload);
+}
+
+pub fn get_nat_profile() -> NatProfile {
+    NAT_PROFILE.read().unwrap().clone()
+}
+
+pub fn is_nat_profile_expired(ttl_secs: u64) -> bool {
+    let profile = get_nat_profile();
+    if profile.sampled_at_unix_ms <= 0 {
+        return true;
+    }
+    now_unix_ms().saturating_sub(profile.sampled_at_unix_ms) >= (ttl_secs as i64) * 1000
+}
+
+pub fn update_nat_profile(mut profile: NatProfile) {
+    if profile.sampled_at_unix_ms <= 0 {
+        profile.sampled_at_unix_ms = now_unix_ms();
+    }
+    *NAT_PROFILE.write().unwrap() = profile.clone();
+    emit_p2p_event(
+        "nat_profile_generated",
+        json!({
+            "class_local": profile.class_local.as_str(),
+            "confidence": profile.confidence,
+            "mapping_varies_by_dest": profile.mapping_varies_by_dest,
+            "mapped_ip_count": profile.mapped_ip_count,
+            "mapped_port_span": profile.mapped_port_span,
+            "port_trend": profile.port_trend,
+            "port_stability": profile.port_stability,
+            "udp_reachability": profile.udp_reachability,
+            "ipv6_ready": profile.ipv6_ready,
+            "sampled_at_unix_ms": profile.sampled_at_unix_ms,
+        }),
+    );
+}
+
+pub fn fold_nat_profile_to_nat_type(profile: &NatProfile) -> NatType {
+    if profile.confidence < 0.3 {
+        return NatType::UNKNOWN_NAT;
+    }
+    match profile.class_local {
+        NatClassLocal::Cone | NatClassLocal::EasySymInc | NatClassLocal::EasySymDec => {
+            NatType::ASYMMETRIC
+        }
+        NatClassLocal::HardSym => NatType::SYMMETRIC,
+        NatClassLocal::Unknown => NatType::UNKNOWN_NAT,
+    }
+}
+
 impl CheckTestNatType {
     pub fn new() -> Self {
         Self {
@@ -595,6 +729,12 @@ pub fn test_nat_type() {
         let is_direct = Config::get_socks().is_none() && !config::use_ws();
         if !is_direct {
             Config::set_nat_type(NatType::SYMMETRIC as _);
+            update_nat_profile(NatProfile {
+                class_local: NatClassLocal::Unknown,
+                confidence: 0.2,
+                sampled_at_unix_ms: now_unix_ms(),
+                ..Default::default()
+            });
             IS_RUNNING.store(false, Ordering::SeqCst);
             return;
         }
@@ -678,6 +818,22 @@ async fn test_nat_type_() -> ResultType<bool> {
             NatType::SYMMETRIC
         };
         Config::set_nat_type(t as _);
+        update_nat_profile(NatProfile {
+            class_local: if t == NatType::ASYMMETRIC {
+                NatClassLocal::Cone
+            } else {
+                NatClassLocal::HardSym
+            },
+            mapped_ip_count: 1,
+            mapped_port_span: port1.abs_diff(port2) as u16,
+            mapping_varies_by_dest: t == NatType::SYMMETRIC,
+            port_trend: 0,
+            port_stability: if t == NatType::ASYMMETRIC { 1.0 } else { 0.0 },
+            udp_reachability: 1.0,
+            ipv6_ready: get_ipv6_socket().await.is_some(),
+            confidence: 0.9,
+            sampled_at_unix_ms: now_unix_ms(),
+        });
         log::info!("Tested nat type: {:?} in {:?}", t, start.elapsed());
     }
     Ok(ok)
@@ -1103,16 +1259,214 @@ pub fn get_ipv6_punch_enabled() -> bool {
     )
 }
 
-pub fn get_local_option(key: &str) -> String {
-    let v = LocalConfig::get_option(key);
-    if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
-        if v.is_empty() {
-            if !is_public(&Config::get_rendezvous_server()) {
-                return "N".to_owned();
+fn get_p2p_feature_enabled(key: &str, default_enabled: bool) -> bool {
+    let value = get_local_option(key);
+    if value.trim().is_empty() {
+        return default_enabled;
+    }
+    config::option2bool(key, &value)
+}
+
+pub fn get_p2p_orchestrator_v2_enabled() -> bool {
+    get_p2p_feature_enabled(keys::OPTION_P2P_ORCHESTRATOR_V2, true)
+}
+
+pub fn get_p2p_nat_profile_v2_enabled() -> bool {
+    get_p2p_feature_enabled(keys::OPTION_P2P_NAT_PROFILE_V2, true)
+}
+
+pub fn get_p2p_easysym_v1_enabled() -> bool {
+    get_p2p_feature_enabled(keys::OPTION_P2P_EASYSYM_V1, true)
+}
+
+pub fn get_p2p_path_memory_v1_enabled() -> bool {
+    get_p2p_feature_enabled(keys::OPTION_P2P_PATH_MEMORY_V1, true)
+}
+
+fn parse_option_u64(value: &str) -> Option<u64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u64>().ok()
+}
+
+fn normalize_option_u64(value: Option<u64>, default_v: u64, min_v: u64, max_v: u64) -> u64 {
+    value.unwrap_or(default_v).clamp(min_v, max_v)
+}
+
+fn normalize_udp_port_ready_window(min_ms: Option<u64>, max_ms: Option<u64>) -> (u64, u64) {
+    let mut min_v = min_ms.unwrap_or(DEFAULT_UDP_PORT_READY_MIN_MS);
+    let mut max_v = max_ms.unwrap_or(DEFAULT_UDP_PORT_READY_MAX_MS);
+    min_v = min_v.clamp(UDP_PORT_READY_ABS_MIN_MS, UDP_PORT_READY_ABS_MAX_MS);
+    max_v = max_v.clamp(UDP_PORT_READY_ABS_MIN_MS, UDP_PORT_READY_ABS_MAX_MS);
+    if min_v > max_v {
+        std::mem::swap(&mut min_v, &mut max_v);
+    }
+    (min_v, max_v)
+}
+
+pub fn get_udp_port_ready_window_bounds_ms() -> (u64, u64) {
+    normalize_udp_port_ready_window(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_UDP_PORT_READY_MIN_MS)),
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_UDP_PORT_READY_MAX_MS)),
+    )
+}
+
+fn calc_udp_port_ready_wait_ms_with_bounds(rtt: Duration, min_ms: u64, max_ms: u64) -> u64 {
+    let half_rtt_ms = (rtt.as_millis() as u64).saturating_div(2);
+    half_rtt_ms.clamp(min_ms, max_ms)
+}
+
+pub fn get_udp_port_ready_wait_ms(rtt: Duration) -> u64 {
+    let (min_ms, max_ms) = get_udp_port_ready_window_bounds_ms();
+    calc_udp_port_ready_wait_ms_with_bounds(rtt, min_ms, max_ms)
+}
+
+pub fn get_p2p_direct_budget_ms() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_DIRECT_BUDGET_MS)),
+        DEFAULT_P2P_DIRECT_BUDGET_MS,
+        P2P_DIRECT_BUDGET_MIN_MS,
+        P2P_DIRECT_BUDGET_MAX_MS,
+    )
+}
+
+pub fn get_p2p_relay_commit_deadline_ms() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_RELAY_COMMIT_DEADLINE_MS)),
+        DEFAULT_P2P_RELAY_COMMIT_DEADLINE_MS,
+        P2P_RELAY_COMMIT_DEADLINE_MIN_MS,
+        P2P_RELAY_COMMIT_DEADLINE_MAX_MS,
+    )
+}
+
+pub fn get_p2p_udp_budget_packets() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_UDP_BUDGET_PACKETS)),
+        DEFAULT_P2P_UDP_BUDGET_PACKETS,
+        P2P_UDP_BUDGET_PACKETS_MIN,
+        P2P_UDP_BUDGET_PACKETS_MAX,
+    )
+}
+
+pub fn get_p2p_easysym_window() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_EASYSYM_WINDOW)),
+        DEFAULT_P2P_EASYSYM_WINDOW,
+        P2P_EASYSYM_WINDOW_MIN,
+        P2P_EASYSYM_WINDOW_MAX,
+    )
+}
+
+pub fn get_p2p_hardsym_fast_fallback_ms() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_HARDSYM_FAST_FALLBACK_MS)),
+        DEFAULT_P2P_HARDSYM_FAST_FALLBACK_MS,
+        P2P_HARDSYM_FAST_FALLBACK_MIN_MS,
+        P2P_HARDSYM_FAST_FALLBACK_MAX_MS,
+    )
+}
+
+pub fn get_p2p_path_cache_ttl_sec() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_PATH_CACHE_TTL_SEC)),
+        DEFAULT_P2P_PATH_CACHE_TTL_SEC,
+        P2P_PATH_CACHE_TTL_MIN_SEC,
+        P2P_PATH_CACHE_TTL_MAX_SEC,
+    )
+}
+
+fn push_candidate_port(candidates: &mut Vec<u16>, port: i64, max_candidates: usize) {
+    if candidates.len() >= max_candidates {
+        return;
+    }
+    if !(1..=(u16::MAX as i64)).contains(&port) {
+        return;
+    }
+    let port = port as u16;
+    if !candidates.contains(&port) {
+        candidates.push(port);
+    }
+}
+
+fn build_easy_sym_port_candidates_impl(
+    base_port: u16,
+    profile: &NatProfile,
+    window: usize,
+    max_candidates: usize,
+) -> Vec<u16> {
+    let mut candidates = Vec::new();
+    let max_candidates = max_candidates.max(1);
+    push_candidate_port(&mut candidates, base_port as i64, max_candidates);
+
+    if profile.confidence < 0.5 {
+        return candidates;
+    }
+
+    let direction: i64 = match profile.class_local {
+        NatClassLocal::EasySymInc => 1,
+        NatClassLocal::EasySymDec => -1,
+        _ => {
+            if profile.port_trend > 0 {
+                1
+            } else if profile.port_trend < 0 {
+                -1
+            } else {
+                0
             }
         }
+    };
+    if direction == 0 {
+        return candidates;
     }
-    v
+
+    let step = (profile.mapped_port_span.max(1) as i64).clamp(1, 64);
+    for idx in 1..=window {
+        let predicted = base_port as i64 + direction * (idx as i64) * step;
+        push_candidate_port(&mut candidates, predicted, max_candidates);
+        push_candidate_port(&mut candidates, predicted + direction, max_candidates);
+        push_candidate_port(&mut candidates, predicted - direction, max_candidates);
+        if candidates.len() >= max_candidates {
+            break;
+        }
+    }
+    candidates
+}
+
+pub fn build_easy_sym_port_candidates(base_port: u16, profile: &NatProfile) -> Vec<u16> {
+    build_easy_sym_port_candidates_impl(
+        base_port,
+        profile,
+        get_p2p_easysym_window() as usize,
+        get_p2p_udp_budget_packets() as usize,
+    )
+}
+
+fn resolve_local_option(
+    key: &str,
+    value: String,
+    rendezvous_server: &str,
+    legacy_non_public_udp_default: bool,
+) -> String {
+    if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
+        if value.is_empty() && legacy_non_public_udp_default && !is_public(rendezvous_server) {
+            return "N".to_owned();
+        }
+    }
+    value
+}
+
+pub fn get_local_option(key: &str) -> String {
+    let value = LocalConfig::get_option(key);
+    let legacy_non_public_udp_default =
+        LocalConfig::get_option(keys::OPTION_P2P_LEGACY_NON_PUBLIC_UDP_DEFAULT) == "Y";
+    resolve_local_option(
+        key,
+        value,
+        &Config::get_rendezvous_server(),
+        legacy_non_public_udp_default,
+    )
 }
 
 pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
@@ -2328,7 +2682,13 @@ mod tests {
         self,
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
-    use std::collections::HashSet;
+    use std::{collections::HashSet, sync::Mutex, sync::MutexGuard};
+
+    static NAT_PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_nat_profile_for_test() -> MutexGuard<'static, ()> {
+        NAT_PROFILE_TEST_LOCK.lock().unwrap()
+    }
 
     #[inline]
     fn get_timestamp_secs() -> u128 {
@@ -2338,6 +2698,204 @@ mod tests {
             .as_millis()
             + 500)
             / 1000
+    }
+
+    #[test]
+    fn test_nat_profile_cache_roundtrip() {
+        let _guard = lock_nat_profile_for_test();
+        let profile = NatProfile {
+            class_local: NatClassLocal::Cone,
+            mapped_ip_count: 1,
+            mapped_port_span: 0,
+            mapping_varies_by_dest: false,
+            port_trend: 0,
+            port_stability: 1.0,
+            udp_reachability: 1.0,
+            ipv6_ready: false,
+            confidence: 0.95,
+            sampled_at_unix_ms: 1,
+        };
+        update_nat_profile(profile.clone());
+        let got = get_nat_profile();
+        assert_eq!(got.class_local, NatClassLocal::Cone);
+        assert_eq!(got.mapped_ip_count, 1);
+        assert_eq!(got.mapped_port_span, 0);
+        assert!(!got.mapping_varies_by_dest);
+        assert_eq!(got.port_trend, 0);
+        assert_eq!(got.port_stability, 1.0);
+        assert_eq!(got.udp_reachability, 1.0);
+        assert_eq!(got.ipv6_ready, false);
+        assert_eq!(got.confidence, 0.95);
+        assert_eq!(got.sampled_at_unix_ms, 1);
+    }
+
+    #[test]
+    fn test_nat_profile_expired_judgement() {
+        let _guard = lock_nat_profile_for_test();
+        update_nat_profile(NatProfile {
+            sampled_at_unix_ms: 1,
+            ..Default::default()
+        });
+        assert!(is_nat_profile_expired(1));
+
+        update_nat_profile(NatProfile {
+            sampled_at_unix_ms: super::now_unix_ms(),
+            ..Default::default()
+        });
+        assert!(!is_nat_profile_expired(3600));
+    }
+
+    #[test]
+    fn test_fold_nat_profile_to_nat_type() {
+        let low_conf = NatProfile {
+            class_local: NatClassLocal::HardSym,
+            confidence: 0.2,
+            ..Default::default()
+        };
+        assert_eq!(super::fold_nat_profile_to_nat_type(&low_conf), NatType::UNKNOWN_NAT);
+
+        let cone = NatProfile {
+            class_local: NatClassLocal::Cone,
+            confidence: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(super::fold_nat_profile_to_nat_type(&cone), NatType::ASYMMETRIC);
+
+        let hard_sym = NatProfile {
+            class_local: NatClassLocal::HardSym,
+            confidence: 0.9,
+            ..Default::default()
+        };
+        assert_eq!(super::fold_nat_profile_to_nat_type(&hard_sym), NatType::SYMMETRIC);
+    }
+
+    #[test]
+    fn test_build_easy_sym_port_candidates_inc() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::EasySymInc,
+            mapped_port_span: 2,
+            confidence: 0.9,
+            ..Default::default()
+        };
+        let got = super::build_easy_sym_port_candidates_impl(40000, &profile, 3, 16);
+        assert_eq!(got[0], 40000);
+        assert!(got.contains(&40002));
+        assert!(got.contains(&40004));
+        assert!(got.contains(&40006));
+    }
+
+    #[test]
+    fn test_build_easy_sym_port_candidates_dec() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::EasySymDec,
+            mapped_port_span: 3,
+            confidence: 0.95,
+            ..Default::default()
+        };
+        let got = super::build_easy_sym_port_candidates_impl(50000, &profile, 2, 16);
+        assert_eq!(got[0], 50000);
+        assert!(got.contains(&49997));
+        assert!(got.contains(&49994));
+    }
+
+    #[test]
+    fn test_build_easy_sym_port_candidates_low_confidence() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::EasySymInc,
+            mapped_port_span: 5,
+            confidence: 0.1,
+            ..Default::default()
+        };
+        let got = super::build_easy_sym_port_candidates_impl(12345, &profile, 5, 8);
+        assert_eq!(got, vec![12345]);
+    }
+
+    #[test]
+    fn test_resolve_local_option_for_udp_punch_defaults() {
+        let _guard = lock_nat_profile_for_test();
+        let non_public_server = "10.0.0.1:21116";
+        let public_server = "rustdesk.com";
+
+        let v = super::resolve_local_option(
+            keys::OPTION_ENABLE_UDP_PUNCH,
+            "".to_owned(),
+            non_public_server,
+            false,
+        );
+        assert_eq!(v, "");
+
+        let v = super::resolve_local_option(
+            keys::OPTION_ENABLE_UDP_PUNCH,
+            "".to_owned(),
+            non_public_server,
+            true,
+        );
+        assert_eq!(v, "N");
+
+        let v = super::resolve_local_option(
+            keys::OPTION_ENABLE_IPV6_PUNCH,
+            "".to_owned(),
+            public_server,
+            true,
+        );
+        assert_eq!(v, "");
+
+        let v = super::resolve_local_option(
+            keys::OPTION_ENABLE_UDP_PUNCH,
+            "Y".to_owned(),
+            non_public_server,
+            true,
+        );
+        assert_eq!(v, "Y");
+
+        let v = super::resolve_local_option(
+            keys::OPTION_ENABLE_UDP_PUNCH,
+            "N".to_owned(),
+            non_public_server,
+            false,
+        );
+        assert_eq!(v, "N");
+    }
+
+    #[test]
+    fn test_normalize_udp_port_ready_window() {
+        assert_eq!(super::normalize_udp_port_ready_window(None, None), (250, 1200));
+        assert_eq!(
+            super::normalize_udp_port_ready_window(Some(10), Some(9_999)),
+            (50, 5000)
+        );
+        assert_eq!(
+            super::normalize_udp_port_ready_window(Some(1500), Some(600)),
+            (600, 1500)
+        );
+    }
+
+    #[test]
+    fn test_get_udp_port_ready_wait_ms_clamp() {
+        let (min_ms, max_ms) = super::normalize_udp_port_ready_window(None, None);
+        let wait_low = Duration::from_millis(20);
+        let wait_mid = Duration::from_millis(1000);
+        let wait_high = Duration::from_millis(10_000);
+        assert_eq!(
+            super::calc_udp_port_ready_wait_ms_with_bounds(wait_low, min_ms, max_ms),
+            min_ms
+        );
+        assert_eq!(
+            super::calc_udp_port_ready_wait_ms_with_bounds(wait_mid, min_ms, max_ms),
+            500
+        );
+        assert_eq!(
+            super::calc_udp_port_ready_wait_ms_with_bounds(wait_high, min_ms, max_ms),
+            max_ms
+        );
+    }
+
+    #[test]
+    fn test_normalize_option_u64_for_budgets() {
+        assert_eq!(super::normalize_option_u64(None, 10, 1, 20), 10);
+        assert_eq!(super::normalize_option_u64(Some(0), 10, 1, 20), 1);
+        assert_eq!(super::normalize_option_u64(Some(99), 10, 1, 20), 20);
+        assert_eq!(super::normalize_option_u64(Some(12), 10, 1, 20), 12);
     }
 
     fn interval_maker() -> Interval {

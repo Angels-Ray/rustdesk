@@ -1,0 +1,91 @@
+name: P2P Matrix
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "src/client.rs"
+      - "src/common.rs"
+      - "src/ui_session_interface.rs"
+      - "src/flutter_ffi.rs"
+      - "libs/hbb_common/src/config.rs"
+      - "docs/p2p_matrix_baseline.sh"
+      - "docs/p2p_events_sample.log"
+      - "docs/p2p_test_matrix.md"
+      - ".github/workflows/p2p-matrix.yml"
+  schedule:
+    - cron: "0 2 * * *"
+
+jobs:
+  p2p-core-tests:
+    name: p2p-core-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install prerequisites
+        shell: bash
+        run: |
+          sudo apt-get -y update
+          sudo apt-get install -y \
+            clang \
+            cmake \
+            curl \
+            gcc \
+            git \
+            g++ \
+            libpam0g-dev \
+            libasound2-dev \
+            libunwind-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            libgtk-3-dev \
+            libpulse-dev \
+            libva-dev \
+            libvdpau-dev \
+            libxcb-randr0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxdo-dev \
+            libxfixes-dev \
+            nasm \
+            wget
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run p2p strategy tests
+        shell: bash
+        run: |
+          cargo test --lib p2p_nat_strategy_tests::
+          cargo test --lib test_build_easy_sym_port_candidates_
+
+  p2p-baseline-parser:
+    name: p2p-baseline-parser
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Install jq
+        shell: bash
+        run: |
+          sudo apt-get -y update
+          sudo apt-get install -y jq
+
+      - name: Validate parser script output
+        shell: bash
+        run: |
+          bash docs/p2p_matrix_baseline.sh docs/p2p_events_sample.log CI-SAMPLE > /tmp/p2p-matrix.json
+          jq -e '.scenario == "CI-SAMPLE"' /tmp/p2p-matrix.json
+          jq -e '.total_attempts >= 1' /tmp/p2p-matrix.json
+          jq -e '.first_connect_p95_ms >= 0' /tmp/p2p-matrix.json
+          jq -e '.relay_reason_distribution | type == "object"' /tmp/p2p-matrix.json

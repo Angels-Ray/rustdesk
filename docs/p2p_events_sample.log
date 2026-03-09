@@ -1,0 +1,6 @@
+2026-03-09T15:00:00Z INFO event.p2p.direct_attempt_started {"peer_id":"peer-a","timeout_ms":800,"direct_budget_ms":800}
+2026-03-09T15:00:01Z INFO event.p2p.direct_established {"peer_id":"peer-a","elapsed_ms":120,"path_type":"UDP"}
+2026-03-09T15:01:00Z INFO event.p2p.direct_attempt_started {"peer_id":"peer-b","timeout_ms":500,"direct_budget_ms":500}
+2026-03-09T15:01:01Z INFO event.p2p.path_memory_hit {"peer_id":"peer-b","age_ms":100}
+2026-03-09T15:01:02Z INFO event.p2p.circuit_breaker_armed {"peer_id":"peer-b","stage":"connect"}
+2026-03-09T15:01:03Z INFO event.p2p.relay_committed {"peer_id":"peer-b","elapsed_ms":460,"reason":"hard_sym_fast_fallback_commit"}

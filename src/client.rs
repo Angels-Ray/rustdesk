@@ -98,6 +98,46 @@ pub const MILLI1: Duration = Duration::from_millis(1);
 pub const SEC30: Duration = Duration::from_secs(30);
 pub const VIDEO_QUEUE_SIZE: usize = 120;
 const MAX_DECODE_FAIL_COUNTER: usize = 3;
+const HARDSYM_FAST_FALLBACK_CONFIDENCE_THRESHOLD: f32 = 0.7;
+const P2P_PATH_MEMORY_OPTION_KEY: &str = "p2p-path-memory-cache-v1";
+const P2P_PATH_KIND_DIRECT: &str = "direct";
+const P2P_PATH_KIND_RELAY: &str = "relay";
+const P2P_PATH_MEMORY_RELAY_HINT_BUDGET_MS: u64 = 600;
+const P2P_CIRCUIT_BREAKER_THRESHOLD: i32 = 3;
+const P2P_CIRCUIT_BREAKER_BUDGET_MS: u64 = 500;
+const P2P_CIRCUIT_BREAKER_FAIL_CAP: i32 = 8;
+
+#[derive(Clone, Copy, Debug)]
+enum ConnectOrchestratorState {
+    Prepare,
+    DirectAttempt,
+    RelayWarmup,
+    RelayCommit,
+    Done,
+}
+
+impl ConnectOrchestratorState {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConnectOrchestratorState::Prepare => "Prepare",
+            ConnectOrchestratorState::DirectAttempt => "DirectAttempt",
+            ConnectOrchestratorState::RelayWarmup => "RelayWarmup",
+            ConnectOrchestratorState::RelayCommit => "RelayCommit",
+            ConnectOrchestratorState::Done => "Done",
+        }
+    }
+}
+
+#[inline]
+fn emit_connect_state(peer_id: &str, state: ConnectOrchestratorState) {
+    crate::emit_p2p_event(
+        "connect_state",
+        serde_json::json!({
+            "peer_id": peer_id,
+            "state": state.as_str(),
+        }),
+    );
+}
 
 #[cfg(target_os = "linux")]
 pub const LOGIN_MSG_DESKTOP_NOT_INITED: &str = "Desktop env is not inited";
@@ -203,10 +243,38 @@ impl Client {
     )> {
         debug_assert!(peer == interface.get_id());
         interface.update_direct(None);
+        interface.update_relay_reason("".to_owned());
         interface.update_received(false);
+        let feature_switches = get_runtime_p2p_feature_switches();
         match Self::_start(peer, key, token, conn_type, interface.clone()).await {
             Err(err) => {
                 let err_str = err.to_string();
+                if !interface.is_force_relay()
+                    && feature_switches.orchestrator_v2
+                    && should_record_direct_failure_on_start_error(&err_str)
+                {
+                    let peer_id = interface.get_id();
+                    let lch = interface.get_lch();
+                    let mut lch = lch.write().unwrap();
+                    let old_failures = lch.direct_failures;
+                    let new_failures = next_direct_failures_on_start_error(
+                        old_failures,
+                        feature_switches.orchestrator_v2,
+                    );
+                    if new_failures != old_failures {
+                        lch.set_direct_failure(new_failures);
+                        drop(lch);
+                        crate::emit_p2p_event(
+                            "direct_failure_recorded",
+                            serde_json::json!({
+                                "peer_id": peer_id,
+                                "direct_failures_before": old_failures.max(0),
+                                "direct_failures_after": new_failures,
+                                "threshold": P2P_CIRCUIT_BREAKER_THRESHOLD,
+                            }),
+                        );
+                    }
+                }
                 if err_str.starts_with("Failed") {
                     bail!(err_str + ": Please try later");
                 } else {
@@ -214,15 +282,48 @@ impl Client {
                 }
             }
             Ok(x) => {
-                // Set x.2 to true only in the connect() function to indicate that direct_failures needs to be updated; everywhere else it should be set to false.
+                // x.2=true means this connection attempt should update direct_failures
+                // (direct success resets to 0; non-direct success increases).
                 if x.2 {
                     let direct_failures = interface.get_lch().read().unwrap().direct_failures;
                     let direct = x.0 .1;
-                    if !interface.is_force_relay() && (direct_failures == 0) != direct {
-                        let n = if direct { 0 } else { 1 };
-                        log::info!("direct_failures updated to {}", n);
-                        interface.get_lch().write().unwrap().set_direct_failure(n);
+                    if !interface.is_force_relay() {
+                        let n = next_direct_failures_on_connect_result(
+                            direct_failures,
+                            direct,
+                            feature_switches.orchestrator_v2,
+                        );
+                        if n != direct_failures {
+                            log::info!("direct_failures updated to {}", n);
+                            interface.get_lch().write().unwrap().set_direct_failure(n);
+                        }
                     }
+                }
+                if feature_switches.path_memory_v1 {
+                    let path_kind = if x.0 .1 {
+                        P2P_PATH_KIND_DIRECT
+                    } else {
+                        P2P_PATH_KIND_RELAY
+                    };
+                    let path_type = x.0 .4;
+                    let network_fingerprint = build_p2p_network_fingerprint();
+                    let path_cache_ttl_sec = crate::get_p2p_path_cache_ttl_sec();
+                    interface.get_lch().write().unwrap().update_p2p_path_memory_success(
+                        network_fingerprint.clone(),
+                        path_kind,
+                        path_type,
+                        path_cache_ttl_sec,
+                    );
+                    crate::emit_p2p_event(
+                        "path_memory_updated",
+                        serde_json::json!({
+                            "peer_id": interface.get_id(),
+                            "network_fingerprint": network_fingerprint,
+                            "path_kind": path_kind,
+                            "path_type": path_type,
+                            "ttl_sec": path_cache_ttl_sec,
+                        }),
+                    );
                 }
                 Ok((x.0, x.1))
             }
@@ -247,6 +348,7 @@ impl Client {
         (i32, String),
         bool,
     )> {
+        emit_connect_state(peer, ConnectOrchestratorState::Prepare);
         if config::is_incoming_only() {
             bail!("Incoming only mode");
         }
@@ -339,28 +441,39 @@ impl Client {
             servers.clone(),
             contained,
         );
-        if udp.0.is_none() {
-            return fut.await;
+        let orchestrator_v2_enabled = crate::get_p2p_orchestrator_v2_enabled();
+        if !orchestrator_v2_enabled {
+            emit_connect_state(peer, ConnectOrchestratorState::DirectAttempt);
+            let res = if should_use_legacy_dual_start(orchestrator_v2_enabled, udp.0.is_some()) {
+                let mut connect_futures = Vec::new();
+                connect_futures.push(fut.boxed());
+                let fut_legacy = Self::_start_inner(
+                    peer.to_owned(),
+                    key.to_owned(),
+                    token.to_owned(),
+                    conn_type,
+                    interface,
+                    (None, None),
+                    None,
+                    rendezvous_server,
+                    servers,
+                    contained,
+                );
+                connect_futures.push(fut_legacy.boxed());
+                match select_ok(connect_futures).await {
+                    Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
+                    Err(e) => Err(e),
+                }
+            } else {
+                fut.await
+            };
+            emit_connect_state(peer, ConnectOrchestratorState::Done);
+            return res;
         }
-        let mut connect_futures = Vec::new();
-        connect_futures.push(fut.boxed());
-        let fut = Self::_start_inner(
-            peer.to_owned(),
-            key.to_owned(),
-            token.to_owned(),
-            conn_type,
-            interface,
-            (None, None),
-            None,
-            rendezvous_server,
-            servers,
-            contained,
-        );
-        connect_futures.push(fut.boxed());
-        match select_ok(connect_futures).await {
-            Ok(conn) => Ok((conn.0 .0, conn.0 .1, conn.0 .2)),
-            Err(e) => Err(e),
-        }
+        emit_connect_state(peer, ConnectOrchestratorState::DirectAttempt);
+        let res = fut.await;
+        emit_connect_state(peer, ConnectOrchestratorState::Done);
+        res
     }
 
     async fn _start_inner(
@@ -385,7 +498,7 @@ impl Client {
         (i32, String),
         bool,
     )> {
-        let mut start = Instant::now();
+        let start = Instant::now();
         let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
         let rtt = start.elapsed();
@@ -414,12 +527,125 @@ impl Client {
         let my_nat_type = crate::get_nat_type(100).await;
         let mut is_local = false;
         let mut feedback = 0;
+        let mut direct_budget_ms = crate::get_p2p_direct_budget_ms();
+        let mut relay_commit_deadline_ms = crate::get_p2p_relay_commit_deadline_ms();
+        let mut hard_sym_fast_fallback_armed = false;
+        let mut path_memory_relay_hint_armed = false;
+        let direct_failures = interface.get_lch().read().unwrap().direct_failures;
+        let mut circuit_breaker_armed = false;
+        let feature_switches = get_runtime_p2p_feature_switches();
+        let orchestrator_v2_enabled = feature_switches.orchestrator_v2;
+        let nat_profile_v2_enabled = feature_switches.nat_profile_v2;
+        let easysym_v1_enabled = feature_switches.easysym_v1;
+        let path_memory_v1_enabled = feature_switches.path_memory_v1;
+        let mut warmed_relay: Option<(
+            Stream,
+            Option<KcpStream>,
+            &'static str,
+            String,
+            Instant,
+        )> = None;
         use hbb_common::protobuf::Enum;
         let nat_type = if interface.is_force_relay() {
             NatType::SYMMETRIC
         } else {
-            NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
+            let mut folded = NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT);
+            if nat_profile_v2_enabled && !crate::is_nat_profile_expired(600) {
+                let profile_folded = crate::fold_nat_profile_to_nat_type(&crate::get_nat_profile());
+                if profile_folded != NatType::UNKNOWN_NAT {
+                    folded = profile_folded;
+                }
+            }
+            folded
         };
+        if orchestrator_v2_enabled
+            && !interface.is_force_relay()
+            && is_p2p_circuit_breaker_armed(direct_failures)
+        {
+            direct_budget_ms = direct_budget_ms.min(P2P_CIRCUIT_BREAKER_BUDGET_MS);
+            relay_commit_deadline_ms =
+                relay_commit_deadline_ms.min(P2P_CIRCUIT_BREAKER_BUDGET_MS);
+            circuit_breaker_armed = true;
+            crate::emit_p2p_event(
+                "circuit_breaker_armed",
+                serde_json::json!({
+                    "peer_id": peer,
+                    "stage": "orchestrator",
+                    "direct_failures": direct_failures,
+                    "threshold": P2P_CIRCUIT_BREAKER_THRESHOLD,
+                    "direct_budget_ms": direct_budget_ms,
+                    "relay_commit_deadline_ms": relay_commit_deadline_ms,
+                }),
+            );
+        }
+        if path_memory_v1_enabled {
+            let path_cache_ttl_sec = crate::get_p2p_path_cache_ttl_sec();
+            let network_fingerprint = build_p2p_network_fingerprint();
+            let path_memory_hint = interface
+                .get_lch()
+                .read()
+                .unwrap()
+                .get_p2p_path_memory_hint(&network_fingerprint, path_cache_ttl_sec);
+            if let Some((hint, age_ms)) = path_memory_hint {
+                crate::emit_p2p_event(
+                    "path_memory_hit",
+                    serde_json::json!({
+                        "peer_id": peer,
+                        "network_fingerprint": network_fingerprint.clone(),
+                        "path_kind": hint.path_kind,
+                        "path_type": hint.path_type,
+                        "age_ms": age_ms,
+                        "ttl_sec": path_cache_ttl_sec,
+                    }),
+                );
+                if !interface.is_force_relay() && hint.path_kind == P2P_PATH_KIND_RELAY {
+                    direct_budget_ms = direct_budget_ms.min(P2P_PATH_MEMORY_RELAY_HINT_BUDGET_MS);
+                    relay_commit_deadline_ms =
+                        relay_commit_deadline_ms.min(P2P_PATH_MEMORY_RELAY_HINT_BUDGET_MS);
+                    path_memory_relay_hint_armed = true;
+                    crate::emit_p2p_event(
+                        "path_memory_relay_hint_applied",
+                        serde_json::json!({
+                            "peer_id": peer,
+                            "network_fingerprint": network_fingerprint.clone(),
+                            "direct_budget_ms": direct_budget_ms,
+                            "relay_commit_deadline_ms": relay_commit_deadline_ms,
+                        }),
+                    );
+                }
+            } else {
+                crate::emit_p2p_event(
+                    "path_memory_miss",
+                    serde_json::json!({
+                        "peer_id": peer,
+                        "network_fingerprint": network_fingerprint.clone(),
+                        "ttl_sec": path_cache_ttl_sec,
+                    }),
+                );
+            }
+        }
+        if nat_profile_v2_enabled && !interface.is_force_relay() {
+            if let Some((fast_fallback_ms, confidence)) = resolve_hardsym_fast_fallback_budget() {
+                let old_deadline = relay_commit_deadline_ms;
+                relay_commit_deadline_ms = relay_commit_deadline_ms.min(fast_fallback_ms);
+                hard_sym_fast_fallback_armed = true;
+                crate::emit_p2p_event(
+                    "hardsym_fast_fallback_armed",
+                    serde_json::json!({
+                        "peer_id": peer,
+                        "stage": "orchestrator",
+                        "confidence": confidence,
+                        "fast_fallback_ms": fast_fallback_ms,
+                        "relay_commit_deadline_before_ms": old_deadline,
+                        "relay_commit_deadline_after_ms": relay_commit_deadline_ms,
+                    }),
+                );
+            }
+        }
+        let relay_delay_commit_window_ms = crate::get_udp_port_ready_wait_ms(rtt)
+            .saturating_mul(2)
+            .clamp(300, 2000)
+            .min(relay_commit_deadline_ms);
 
         if !key.is_empty() && !token.is_empty() {
             // mainly for the security of token
@@ -427,14 +653,14 @@ impl Client {
                 .await
                 .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
         } else if let Some(udp) = udp.1.as_ref() {
+            let udp_port_ready_wait_ms = crate::get_udp_port_ready_wait_ms(rtt);
             let tm = Instant::now();
             loop {
                 let port = *udp.lock().unwrap();
                 if port > 0 {
                     break;
                 }
-                // await for 0.5 RTT
-                if tm.elapsed() > rtt / 2 {
+                if tm.elapsed() > Duration::from_millis(udp_port_ready_wait_ms) {
                     break;
                 }
                 hbb_common::sleep(0.001).await;
@@ -467,6 +693,18 @@ impl Client {
             ..Default::default()
         });
         for i in 1..=3 {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            if elapsed_ms >= direct_budget_ms {
+                log::info!(
+                    "direct budget exhausted before punch attempt, elapsed={}ms, budget={}ms",
+                    elapsed_ms,
+                    direct_budget_ms
+                );
+                break;
+            }
+            if warmed_relay.is_some() && elapsed_ms >= relay_commit_deadline_ms {
+                break;
+            }
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
                 i,
@@ -476,8 +714,24 @@ impl Client {
             );
             socket.send(&msg_out).await?;
             // below timeout should not bigger than hbbs's connection timeout.
+            let default_wait_timeout_ms = (i * 3000) as u64;
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            let remaining_direct_budget_ms = direct_budget_ms.saturating_sub(elapsed_ms).max(1);
+            let mut wait_timeout_ms = default_wait_timeout_ms.min(remaining_direct_budget_ms);
+            if let Some((_, _, _, _, warmed_at)) = warmed_relay.as_ref() {
+                let warmed_elapsed_ms = warmed_at.elapsed().as_millis() as u64;
+                let remaining_relay_delay_window_ms = relay_delay_commit_window_ms
+                    .saturating_sub(warmed_elapsed_ms)
+                    .max(1);
+                let remaining_commit_deadline_ms = relay_commit_deadline_ms
+                    .saturating_sub(elapsed_ms)
+                    .max(1);
+                wait_timeout_ms = wait_timeout_ms
+                    .min(remaining_relay_delay_window_ms)
+                    .min(remaining_commit_deadline_ms);
+            }
             if let Some(msg_in) =
-                crate::get_next_nonkeyexchange_msg(&mut socket, Some(i * 3000)).await
+                crate::get_next_nonkeyexchange_msg(&mut socket, Some(wait_timeout_ms as _)).await
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
@@ -525,18 +779,48 @@ impl Client {
                                 }
                             }
                             log::info!("{} Hole Punched {} = {}", punch_type, peer, peer_addr);
+                            if easysym_v1_enabled && !crate::is_nat_profile_expired(600) {
+                                let profile = crate::get_nat_profile();
+                                let candidates =
+                                    crate::build_easy_sym_port_candidates(peer_addr.port(), &profile);
+                                if candidates.len() > 1 {
+                                    crate::emit_p2p_event(
+                                        "easysym_candidates_generated",
+                                        serde_json::json!({
+                                            "peer_id": peer,
+                                            "base_port": peer_addr.port(),
+                                            "candidate_count": candidates.len(),
+                                            "candidates": candidates,
+                                            "class_local": profile.class_local.as_str(),
+                                            "confidence": profile.confidence,
+                                        }),
+                                    );
+                                }
+                            }
                             break;
                         }
                     }
                     Some(rendezvous_message::Union::RelayResponse(rr)) => {
+                        emit_connect_state(&peer, ConnectOrchestratorState::RelayWarmup);
+                        if warmed_relay.is_some() {
+                            continue;
+                        }
                         log::info!(
                             "relay requested from peer, time used: {:?}, relay_server: {}",
                             start.elapsed(),
                             rr.relay_server
                         );
-                        start = Instant::now();
+                        crate::emit_p2p_event(
+                            "relay_warmup_started",
+                            serde_json::json!({
+                                "peer_id": peer,
+                                "relay_server": rr.relay_server.clone(),
+                                "elapsed_ms": start.elapsed().as_millis() as u64,
+                            }),
+                        );
+                        let relay_warmup_start = Instant::now();
                         let mut connect_futures = Vec::new();
-                        if let Some(s) = ipv6.0 {
+                        if let Some(s) = ipv6.0.as_ref().cloned() {
                             let addr = AddrMangle::decode(&rr.socket_addr_v6);
                             if addr.port() > 0 {
                                 if s.connect(addr).await.is_ok() {
@@ -546,6 +830,7 @@ impl Client {
                             }
                         }
                         signed_id_pk = rr.pk().into();
+                        let relay_server_for_event = rr.relay_server.clone();
                         let fut = Self::create_relay(
                             &peer,
                             rr.uuid,
@@ -561,31 +846,79 @@ impl Client {
                             }
                             .boxed(),
                         );
-                        // Run all connection attempts concurrently, return the first successful one
-                        let (conn, kcp, typ) = match select_ok(connect_futures).await {
-                            Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
-
-                            Err(e) => (Err(e), None, ""),
+                        let (mut conn, kcp, typ) = match select_ok(connect_futures).await {
+                            Ok(conn) => (conn.0 .0, conn.0 .1, conn.0 .2),
+                            Err(e) => {
+                                log::warn!("relay warmup failed: {}", e);
+                                continue;
+                            }
                         };
-                        let mut conn = conn?;
                         feedback = rr.feedback;
-                        log::info!("{:?} used to establish {typ} connection", start.elapsed());
+                        if typ == "Relay" || typ == "WebSocket" {
+                            warmed_relay = Some((
+                                conn,
+                                kcp,
+                                typ,
+                                relay_server_for_event,
+                                Instant::now(),
+                            ));
+                            continue;
+                        }
+                        log::info!(
+                            "{:?} used to establish {typ} connection",
+                            relay_warmup_start.elapsed()
+                        );
                         let pk =
                             Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
                         return Ok((
                             (conn, typ == "IPv6", pk, kcp, typ),
                             (feedback, rendezvous_server),
-                            false,
+                            true,
                         ));
                     }
                     _ => {
                         log::error!("Unexpected protobuf msg received: {:?}", msg_in);
                     }
                 }
+            } else if let Some((_, _, _, _, warmed_at)) = warmed_relay.as_ref() {
+                if should_commit_warmed_relay(
+                    warmed_at.elapsed().as_millis() as u64,
+                    start.elapsed().as_millis() as u64,
+                    relay_delay_commit_window_ms,
+                    relay_commit_deadline_ms,
+                ) {
+                    break;
+                }
             }
         }
         drop(socket);
         if peer_addr.port() == 0 {
+            if let Some((mut conn, kcp, typ, relay_server_for_event, _)) = warmed_relay {
+                let relay_reason = resolve_warmed_relay_commit_reason(
+                    hard_sym_fast_fallback_armed,
+                    path_memory_relay_hint_armed,
+                    circuit_breaker_armed,
+                );
+                interface.update_relay_reason(relay_reason.to_owned());
+                emit_connect_state(&peer, ConnectOrchestratorState::RelayCommit);
+                crate::emit_p2p_event(
+                    "relay_committed",
+                    serde_json::json!({
+                        "peer_id": peer,
+                        "relay_server": relay_server_for_event,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "punch_type": punch_type,
+                        "path_type": typ,
+                        "reason": relay_reason,
+                    }),
+                );
+                let pk = Self::secure_connection(&peer, signed_id_pk, &key, &mut conn).await?;
+                return Ok((
+                    (conn, false, pk, kcp, typ),
+                    (feedback, rendezvous_server),
+                    true,
+                ));
+            }
             bail!("Failed to connect via rendezvous server");
         }
         let time_used = start.elapsed().as_millis() as u64;
@@ -619,6 +952,7 @@ impl Client {
                 udp.0,
                 ipv6.0,
                 punch_type,
+                warmed_relay.map(|(conn, kcp, typ, relay_server, _)| (conn, kcp, typ, relay_server)),
             )
             .await?,
             (feedback, rendezvous_server),
@@ -645,6 +979,7 @@ impl Client {
         udp_socket_nat: Option<Arc<UdpSocket>>,
         udp_socket_v6: Option<Arc<UdpSocket>>,
         punch_type: &str,
+        warmed_relay: Option<(Stream, Option<KcpStream>, &'static str, String)>,
     ) -> ResultType<(
         Stream,
         bool,
@@ -653,6 +988,11 @@ impl Client {
         &'static str,
     )> {
         let direct_failures = interface.get_lch().read().unwrap().direct_failures;
+        let feature_switches = get_runtime_p2p_feature_switches();
+        let orchestrator_v2_enabled = feature_switches.orchestrator_v2;
+        let nat_profile_v2_enabled = feature_switches.nat_profile_v2;
+        let path_memory_v1_enabled = feature_switches.path_memory_v1;
+        let easysym_v1_enabled = feature_switches.easysym_v1;
         let mut connect_timeout = 0;
         const MIN: u64 = 1000;
         if is_local || peer_nat_type == NatType::SYMMETRIC {
@@ -684,8 +1024,82 @@ impl Client {
                 connect_timeout = MIN;
             }
         }
+        let mut direct_budget_ms = crate::get_p2p_direct_budget_ms();
+        if orchestrator_v2_enabled
+            && !interface.is_force_relay()
+            && is_p2p_circuit_breaker_armed(direct_failures)
+        {
+            let old_budget = direct_budget_ms;
+            direct_budget_ms = direct_budget_ms.min(P2P_CIRCUIT_BREAKER_BUDGET_MS);
+            crate::emit_p2p_event(
+                "circuit_breaker_armed",
+                serde_json::json!({
+                    "peer_id": peer_id,
+                    "stage": "connect",
+                    "direct_failures": direct_failures,
+                    "threshold": P2P_CIRCUIT_BREAKER_THRESHOLD,
+                    "direct_budget_before_ms": old_budget,
+                    "direct_budget_after_ms": direct_budget_ms,
+                }),
+            );
+        }
+        if path_memory_v1_enabled {
+            let path_cache_ttl_sec = crate::get_p2p_path_cache_ttl_sec();
+            let network_fingerprint = build_p2p_network_fingerprint();
+            if let Some((hint, age_ms)) = interface
+                .get_lch()
+                .read()
+                .unwrap()
+                .get_p2p_path_memory_hint(&network_fingerprint, path_cache_ttl_sec)
+            {
+                if !interface.is_force_relay() && hint.path_kind == P2P_PATH_KIND_RELAY {
+                    let old_budget = direct_budget_ms;
+                    direct_budget_ms = direct_budget_ms.min(P2P_PATH_MEMORY_RELAY_HINT_BUDGET_MS);
+                    crate::emit_p2p_event(
+                        "path_memory_relay_hint_applied",
+                        serde_json::json!({
+                            "peer_id": peer_id,
+                            "stage": "connect",
+                            "network_fingerprint": network_fingerprint,
+                            "age_ms": age_ms,
+                            "direct_budget_before_ms": old_budget,
+                            "direct_budget_after_ms": direct_budget_ms,
+                        }),
+                    );
+                }
+            }
+        }
+        if nat_profile_v2_enabled && !interface.is_force_relay() {
+            if let Some((fast_fallback_ms, confidence)) = resolve_hardsym_fast_fallback_budget() {
+                let old_budget = direct_budget_ms;
+                direct_budget_ms = direct_budget_ms.min(fast_fallback_ms);
+                crate::emit_p2p_event(
+                    "hardsym_fast_fallback_armed",
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "stage": "connect",
+                        "confidence": confidence,
+                        "fast_fallback_ms": fast_fallback_ms,
+                        "direct_budget_before_ms": old_budget,
+                        "direct_budget_after_ms": direct_budget_ms,
+                    }),
+                );
+            }
+        }
+        connect_timeout = connect_timeout.min(direct_budget_ms);
         log::info!("peer address: {}, timeout: {}", peer, connect_timeout);
         let start = std::time::Instant::now();
+        crate::emit_p2p_event(
+            "direct_attempt_started",
+            serde_json::json!({
+                "peer_id": peer_id,
+                "peer_addr": peer.to_string(),
+                "timeout_ms": connect_timeout,
+                "direct_budget_ms": direct_budget_ms,
+                "punch_type": punch_type,
+                "direct_failures": direct_failures,
+            }),
+        );
 
         let mut connect_futures = Vec::new();
         let fut = connect_tcp_local(peer, Some(local_addr), connect_timeout);
@@ -697,20 +1111,72 @@ impl Client {
             .boxed(),
         );
         if let Some(udp_socket_nat) = udp_socket_nat {
-            connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
+            if easysym_v1_enabled {
+                let udp_budget_packets = crate::get_p2p_udp_budget_packets() as usize;
+                let easysym_candidate_ports = plan_easysym_candidate_ports(peer, peer_nat_type);
+                if easysym_candidate_ports.len() > 1 {
+                    let peer_id_for_udp = peer_id.to_owned();
+                    crate::emit_p2p_event(
+                        "easysym_executor_prepared",
+                        serde_json::json!({
+                            "peer_id": peer_id,
+                            "peer_addr": peer.to_string(),
+                            "candidate_count": easysym_candidate_ports.len(),
+                            "udp_budget_packets": udp_budget_packets,
+                        }),
+                    );
+                    connect_futures.push(
+                        udp_nat_connect_with_easysym_candidates(
+                            udp_socket_nat,
+                            peer,
+                            peer_id_for_udp,
+                            easysym_candidate_ports,
+                            connect_timeout,
+                            udp_budget_packets,
+                        )
+                        .boxed(),
+                    );
+                } else {
+                    connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
+                }
+            } else {
+                connect_futures.push(udp_nat_connect(udp_socket_nat, "UDP", connect_timeout).boxed());
+            }
         }
         if let Some(udp_socket_v6) = udp_socket_v6 {
             connect_futures.push(udp_nat_connect(udp_socket_v6, "IPv6", connect_timeout).boxed());
         }
         // Run all connection attempts concurrently, return the first successful one
-        let (mut conn, kcp, mut typ) = match select_ok(connect_futures).await {
+        let (mut conn, mut kcp, mut typ) = match select_ok(connect_futures).await {
             Ok(conn) => (Ok(conn.0 .0), conn.0 .1, conn.0 .2),
             Err(e) => (Err(e), None, ""),
         };
 
         let mut direct = !conn.is_err();
         if interface.is_force_relay() || conn.is_err() {
-            if !relay_server.is_empty() {
+            if let Some((relay_conn, relay_kcp, relay_typ, relay_server_for_event)) = warmed_relay {
+                let relay_reason = if interface.is_force_relay() {
+                    "force_relay_reuse_warmed"
+                } else {
+                    "direct_failed_reuse_warmed"
+                };
+                interface.update_relay_reason(relay_reason.to_owned());
+                conn = Ok(relay_conn);
+                kcp = relay_kcp;
+                typ = relay_typ;
+                direct = false;
+                crate::emit_p2p_event(
+                    "relay_committed",
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "relay_server": relay_server_for_event,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "punch_type": punch_type,
+                        "path_type": typ,
+                        "reason": relay_reason,
+                    }),
+                );
+            } else if !relay_server.is_empty() {
                 conn = Self::request_relay(
                     peer_id,
                     relay_server.to_owned(),
@@ -724,11 +1190,46 @@ impl Client {
                 if let Err(e) = conn {
                     // this direct is mainly used by on_establish_connection_error, so we update it here before bail
                     interface.update_direct(Some(false));
+                    crate::emit_p2p_event(
+                        "connect_failed",
+                        serde_json::json!({
+                            "peer_id": peer_id,
+                            "stage": "relay",
+                            "reason": e.to_string(),
+                            "elapsed_ms": start.elapsed().as_millis() as u64,
+                        }),
+                    );
                     bail!("Failed to connect via relay server: {}", e);
                 }
                 typ = "Relay";
                 direct = false;
+                let relay_reason = if interface.is_force_relay() {
+                    "force_relay_request"
+                } else {
+                    "direct_failed_request"
+                };
+                interface.update_relay_reason(relay_reason.to_owned());
+                crate::emit_p2p_event(
+                    "relay_committed",
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "relay_server": relay_server,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "punch_type": punch_type,
+                        "path_type": typ,
+                        "reason": relay_reason,
+                    }),
+                );
             } else {
+                crate::emit_p2p_event(
+                    "connect_failed",
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "stage": "direct",
+                        "reason": "relay_server_empty",
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                    }),
+                );
                 bail!("Failed to make direct connection to remote desktop");
             }
         }
@@ -744,10 +1245,32 @@ impl Client {
             Err(e) => {
                 // this direct is mainly used by on_establish_connection_error, so we update it here before bail
                 interface.update_direct(Some(direct));
+                crate::emit_p2p_event(
+                    "connect_failed",
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "stage": "secure_connection",
+                        "reason": e.to_string(),
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                        "path_type": typ,
+                    }),
+                );
                 bail!(e);
             }
         };
         log::debug!("{} punch secure_connection ok", punch_type);
+        if direct {
+            interface.update_relay_reason("".to_owned());
+            crate::emit_p2p_event(
+                "direct_established",
+                serde_json::json!({
+                    "peer_id": peer_id,
+                    "path_type": typ,
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                    "punch_type": punch_type,
+                }),
+            );
+        }
         Ok((conn, direct, pk, kcp, typ))
     }
 
@@ -1722,6 +2245,13 @@ struct ConnToken {
     session_id: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct P2pPathMemoryEntry {
+    path_kind: String,
+    path_type: String,
+    success_at_unix_ms: i64,
+}
+
 /// Login config handler for [`Client`].
 #[derive(Default)]
 pub struct LoginConfigHandler {
@@ -1740,6 +2270,7 @@ pub struct LoginConfigHandler {
     pub restarting_remote_device: bool,
     pub force_relay: bool,
     pub direct: Option<bool>,
+    pub relay_reason: String,
     pub received: bool,
     switch_uuid: Option<String>,
     pub save_ab_password_to_recent: bool, // true: connected with ab password
@@ -1857,6 +2388,7 @@ impl LoginConfigHandler {
         }
 
         self.direct = None;
+        self.relay_reason = "".to_owned();
         self.received = false;
         self.switch_uuid = switch_uuid;
         self.adapter_luid = adapter_luid;
@@ -2014,6 +2546,56 @@ impl LoginConfigHandler {
         let mut config = self.load_config();
         config.direct_failures = value;
         self.save_config(config);
+    }
+
+    fn load_p2p_path_memory_table(&self) -> HashMap<String, P2pPathMemoryEntry> {
+        let raw = self.get_option(P2P_PATH_MEMORY_OPTION_KEY);
+        if raw.is_empty() {
+            return HashMap::new();
+        }
+        serde_json::from_str::<HashMap<String, P2pPathMemoryEntry>>(&raw).unwrap_or_default()
+    }
+
+    fn save_p2p_path_memory_table(&mut self, table: &HashMap<String, P2pPathMemoryEntry>) {
+        let Ok(raw) = serde_json::to_string(table) else {
+            return;
+        };
+        let mut config = self.load_config();
+        config
+            .options
+            .insert(P2P_PATH_MEMORY_OPTION_KEY.to_owned(), raw);
+        self.save_config(config);
+    }
+
+    fn get_p2p_path_memory_hint(
+        &self,
+        network_fingerprint: &str,
+        ttl_sec: u64,
+    ) -> Option<(P2pPathMemoryEntry, u64)> {
+        let table = self.load_p2p_path_memory_table();
+        let now_ms = p2p_now_unix_ms();
+        resolve_p2p_path_memory_hint(&table, network_fingerprint, now_ms, ttl_sec)
+    }
+
+    fn update_p2p_path_memory_success(
+        &mut self,
+        network_fingerprint: String,
+        path_kind: &str,
+        path_type: &str,
+        ttl_sec: u64,
+    ) {
+        let mut table = self.load_p2p_path_memory_table();
+        let now_ms = p2p_now_unix_ms();
+        prune_p2p_path_memory_table(&mut table, now_ms, ttl_sec);
+        table.insert(
+            network_fingerprint,
+            P2pPathMemoryEntry {
+                path_kind: path_kind.to_owned(),
+                path_type: path_type.to_owned(),
+                success_at_unix_ms: now_ms,
+            },
+        );
+        self.save_p2p_path_memory_table(&table);
     }
 
     /// Get a ui config of flutter for handler's [`PeerConfig`].
@@ -3643,6 +4225,10 @@ pub trait Interface: Send + Clone + 'static + Sized {
         self.get_lch().write().unwrap().direct = direct;
     }
 
+    fn update_relay_reason(&self, reason: String) {
+        self.get_lch().write().unwrap().relay_reason = reason;
+    }
+
     fn update_received(&self, received: bool) {
         self.get_lch().write().unwrap().received = received;
     }
@@ -4071,6 +4657,322 @@ pub mod peer_online {
     }
 }
 
+fn p2p_now_unix_ms() -> i64 {
+    std::time::SystemTime::UNIX_EPOCH
+        .elapsed()
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
+}
+
+fn build_p2p_network_fingerprint() -> String {
+    let mut nat_class = "unknown";
+    if crate::get_p2p_nat_profile_v2_enabled() && !crate::is_nat_profile_expired(600) {
+        nat_class = crate::get_nat_profile().class_local.as_str();
+    }
+    format!(
+        "rz={};proxy={};ws={};nat={}",
+        Config::get_rendezvous_server(),
+        Config::is_proxy(),
+        use_ws(),
+        nat_class
+    )
+}
+
+fn prune_p2p_path_memory_table(
+    table: &mut HashMap<String, P2pPathMemoryEntry>,
+    now_ms: i64,
+    ttl_sec: u64,
+) {
+    let ttl_ms = (ttl_sec as i64).saturating_mul(1000);
+    table.retain(|_, entry| now_ms.saturating_sub(entry.success_at_unix_ms) < ttl_ms);
+}
+
+fn resolve_p2p_path_memory_hint(
+    table: &HashMap<String, P2pPathMemoryEntry>,
+    network_fingerprint: &str,
+    now_ms: i64,
+    ttl_sec: u64,
+) -> Option<(P2pPathMemoryEntry, u64)> {
+    let entry = table.get(network_fingerprint)?;
+    let age_ms = now_ms.saturating_sub(entry.success_at_unix_ms).max(0) as u64;
+    if age_ms >= ttl_sec.saturating_mul(1000) {
+        return None;
+    }
+    Some((entry.clone(), age_ms))
+}
+
+fn should_use_legacy_dual_start(orchestrator_v2_enabled: bool, has_udp_socket: bool) -> bool {
+    !orchestrator_v2_enabled && has_udp_socket
+}
+
+fn should_commit_warmed_relay(
+    warmed_elapsed_ms: u64,
+    total_elapsed_ms: u64,
+    relay_delay_commit_window_ms: u64,
+    relay_commit_deadline_ms: u64,
+) -> bool {
+    warmed_elapsed_ms >= relay_delay_commit_window_ms || total_elapsed_ms >= relay_commit_deadline_ms
+}
+
+fn resolve_warmed_relay_commit_reason(
+    hard_sym_fast_fallback_armed: bool,
+    path_memory_relay_hint_armed: bool,
+    circuit_breaker_armed: bool,
+) -> &'static str {
+    if hard_sym_fast_fallback_armed {
+        "hard_sym_fast_fallback_commit"
+    } else if path_memory_relay_hint_armed {
+        "path_memory_relay_hint_commit"
+    } else if circuit_breaker_armed {
+        "circuit_breaker_fast_commit"
+    } else {
+        "relay_warmup_commit_after_direct_window"
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct P2pFeatureSwitches {
+    orchestrator_v2: bool,
+    nat_profile_v2: bool,
+    easysym_v1: bool,
+    path_memory_v1: bool,
+}
+
+fn resolve_p2p_feature_switches(
+    orchestrator_v2_raw: bool,
+    nat_profile_v2_raw: bool,
+    easysym_v1_raw: bool,
+    path_memory_v1_raw: bool,
+) -> P2pFeatureSwitches {
+    P2pFeatureSwitches {
+        orchestrator_v2: orchestrator_v2_raw,
+        nat_profile_v2: orchestrator_v2_raw && nat_profile_v2_raw,
+        easysym_v1: orchestrator_v2_raw && easysym_v1_raw,
+        path_memory_v1: orchestrator_v2_raw && path_memory_v1_raw,
+    }
+}
+
+fn get_runtime_p2p_feature_switches() -> P2pFeatureSwitches {
+    resolve_p2p_feature_switches(
+        crate::get_p2p_orchestrator_v2_enabled(),
+        crate::get_p2p_nat_profile_v2_enabled(),
+        crate::get_p2p_easysym_v1_enabled(),
+        crate::get_p2p_path_memory_v1_enabled(),
+    )
+}
+
+fn next_direct_failures_on_start_error(
+    direct_failures: i32,
+    orchestrator_v2_enabled: bool,
+) -> i32 {
+    if !orchestrator_v2_enabled {
+        return direct_failures;
+    }
+    (direct_failures.max(0) + 1).min(P2P_CIRCUIT_BREAKER_FAIL_CAP)
+}
+
+fn should_record_direct_failure_on_start_error(err_str: &str) -> bool {
+    let lower = err_str.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    if lower.contains("id does not exist")
+        || lower.contains("offline")
+        || lower.contains("key mismatch")
+        || lower.contains("key overuse")
+        || lower.contains("license")
+        || lower.contains("incoming only mode")
+    {
+        return false;
+    }
+    true
+}
+
+fn next_direct_failures_on_connect_result(
+    direct_failures: i32,
+    direct_established: bool,
+    orchestrator_v2_enabled: bool,
+) -> i32 {
+    if direct_established {
+        return 0;
+    }
+    if !orchestrator_v2_enabled {
+        return 1;
+    }
+    (direct_failures + 1).clamp(1, P2P_CIRCUIT_BREAKER_FAIL_CAP)
+}
+
+fn is_p2p_circuit_breaker_armed(direct_failures: i32) -> bool {
+    direct_failures >= P2P_CIRCUIT_BREAKER_THRESHOLD
+}
+
+fn is_hardsym_fast_fallback_profile(profile: &crate::NatProfile) -> bool {
+    profile.class_local == crate::NatClassLocal::HardSym
+        && profile.confidence >= HARDSYM_FAST_FALLBACK_CONFIDENCE_THRESHOLD
+}
+
+fn resolve_hardsym_fast_fallback_budget() -> Option<(u64, f32)> {
+    let switches = get_runtime_p2p_feature_switches();
+    let profile = if crate::is_nat_profile_expired(600) {
+        None
+    } else {
+        Some(crate::get_nat_profile())
+    };
+    resolve_hardsym_fast_fallback_budget_with_profile(
+        switches.orchestrator_v2,
+        switches.nat_profile_v2,
+        profile.as_ref(),
+        crate::get_p2p_hardsym_fast_fallback_ms(),
+    )
+}
+
+fn resolve_hardsym_fast_fallback_budget_with_profile(
+    orchestrator_v2_enabled: bool,
+    nat_profile_v2_enabled: bool,
+    profile: Option<&crate::NatProfile>,
+    fast_fallback_ms: u64,
+) -> Option<(u64, f32)> {
+    if !orchestrator_v2_enabled || !nat_profile_v2_enabled {
+        return None;
+    }
+    let profile = profile?;
+    if !is_hardsym_fast_fallback_profile(profile) {
+        return None;
+    }
+    Some((fast_fallback_ms, profile.confidence))
+}
+
+fn plan_easysym_candidate_ports(peer: SocketAddr, peer_nat_type: NatType) -> Vec<u16> {
+    let switches = get_runtime_p2p_feature_switches();
+    let profile = if crate::is_nat_profile_expired(600) {
+        None
+    } else {
+        Some(crate::get_nat_profile())
+    };
+    plan_easysym_candidate_ports_with_profile(
+        peer.port(),
+        peer_nat_type,
+        profile.as_ref(),
+        switches.orchestrator_v2,
+        switches.easysym_v1,
+    )
+}
+
+fn plan_easysym_candidate_ports_with_profile(
+    peer_port: u16,
+    peer_nat_type: NatType,
+    profile: Option<&crate::NatProfile>,
+    orchestrator_v2_enabled: bool,
+    easysym_v1_enabled: bool,
+) -> Vec<u16> {
+    if !orchestrator_v2_enabled || !easysym_v1_enabled {
+        return vec![peer_port];
+    }
+    if peer_nat_type != NatType::ASYMMETRIC {
+        return vec![peer_port];
+    }
+    let profile = match profile {
+        Some(v) => v,
+        None => return vec![peer_port],
+    };
+    if profile.confidence < 0.5 {
+        return vec![peer_port];
+    }
+    if !matches!(
+        profile.class_local,
+        crate::NatClassLocal::EasySymInc | crate::NatClassLocal::EasySymDec
+    ) {
+        return vec![peer_port];
+    }
+    let ports = crate::build_easy_sym_port_candidates(peer_port, profile);
+    if ports.is_empty() {
+        vec![peer_port]
+    } else {
+        ports
+    }
+}
+
+async fn udp_nat_connect_with_easysym_candidates(
+    socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
+    peer_id: String,
+    candidate_ports: Vec<u16>,
+    connect_timeout_ms: u64,
+    udp_budget_packets: usize,
+) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
+    let mut last_err = anyhow!("easysym candidate connect failed");
+    let total_candidates = candidate_ports.len();
+    let max_attempts = total_candidates.max(1).min(udp_budget_packets.max(1));
+    let start = Instant::now();
+    let per_try_ms = connect_timeout_ms
+        .saturating_div(max_attempts as u64)
+        .clamp(120, 1200);
+    crate::emit_p2p_event(
+        "easysym_executor_started",
+        serde_json::json!({
+            "peer_id": peer_id,
+            "base_port": peer_addr.port(),
+            "candidate_count": total_candidates,
+            "max_attempts": max_attempts,
+            "connect_timeout_ms": connect_timeout_ms,
+            "per_try_ms": per_try_ms,
+            "udp_budget_packets": udp_budget_packets,
+        }),
+    );
+
+    for (idx, port) in candidate_ports.into_iter().take(max_attempts).enumerate() {
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        if elapsed_ms >= connect_timeout_ms {
+            break;
+        }
+        let remaining_ms = connect_timeout_ms.saturating_sub(elapsed_ms).max(1);
+        let try_timeout_ms = per_try_ms.min(remaining_ms).max(80);
+        let mut target = peer_addr;
+        target.set_port(port);
+        if let Err(err) = socket.connect(target).await {
+            last_err = anyhow!("connect udp socket to {target} failed: {err}");
+            continue;
+        }
+        match timeout(try_timeout_ms, udp_nat_connect(socket.clone(), "UDP", try_timeout_ms)).await
+        {
+            Ok(Ok((stream, kcp, typ))) => {
+                crate::emit_p2p_event(
+                    "easysym_executor_succeeded",
+                    serde_json::json!({
+                        "peer_id": peer_id,
+                        "matched_port": port,
+                        "attempt_index": idx + 1,
+                        "attempted_total": idx + 1,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                    }),
+                );
+                return Ok((stream, kcp, typ));
+            }
+            Ok(Err(err)) => {
+                last_err = err;
+            }
+            Err(_) => {
+                last_err = anyhow!(
+                    "easysym attempt timed out: port={port}, timeout={}ms",
+                    try_timeout_ms
+                );
+            }
+        }
+    }
+
+    crate::emit_p2p_event(
+        "easysym_executor_exhausted",
+        serde_json::json!({
+            "peer_id": peer_id,
+            "elapsed_ms": start.elapsed().as_millis() as u64,
+            "connect_timeout_ms": connect_timeout_ms,
+            "max_attempts": max_attempts,
+            "reason": format!("{last_err}"),
+        }),
+    );
+    Err(last_err)
+}
+
 async fn test_udp_uat(
     udp_socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
@@ -4094,10 +4996,14 @@ async fn test_udp_uat(
     let mut retry_interval = Duration::from_millis(20); // Start fast
     const MAX_INTERVAL: Duration = Duration::from_millis(200);
     let mut packets_sent = 0;
+    let udp_budget_packets = crate::get_p2p_udp_budget_packets() as usize;
 
     // Send initial burst to improve reliability
     let data = msg_out.write_to_bytes()?;
     for _ in 0..2 {
+        if packets_sent >= udp_budget_packets {
+            break;
+        }
         if let Err(e) = udp_socket.send_to(&data, server_addr).await {
             log::warn!("Failed to send initial UDP NAT test packet: {}", e);
         } else {
@@ -4123,6 +5029,13 @@ async fn test_udp_uat(
                 let elapsed = last_send_time.elapsed();
 
                 if elapsed >= retry_interval {
+                    if packets_sent >= udp_budget_packets {
+                        log::debug!(
+                            "UDP NAT test packet budget reached: {} packets",
+                            udp_budget_packets
+                        );
+                        break;
+                    }
                     // Send single packet (not double) to reduce network load
                     if let Err(e) = udp_socket.send_to(&data, server_addr).await {
                         log::warn!("Failed to send UDP NAT test retry packet: {}", e);
@@ -4163,11 +5076,12 @@ async fn test_udp_uat(
 
     let final_port = *udp_port.lock().unwrap();
     log::debug!(
-        "UDP NAT test to {:?} finished: time={:?}, port={}, packets_sent={}, success={}",
+        "UDP NAT test to {:?} finished: time={:?}, port={}, packets_sent={}, packet_budget={}, success={}",
         server_addr,
         start.elapsed(),
         final_port,
         packets_sent,
+        udp_budget_packets,
         final_port > 0
     );
     Ok(())
@@ -4192,4 +5106,329 @@ async fn udp_nat_connect(
             anyhow!(err)
         })?;
     Ok((res.1, Some(res.0), typ))
+}
+
+#[cfg(test)]
+mod p2p_nat_strategy_tests {
+    use super::{
+        is_hardsym_fast_fallback_profile, is_p2p_circuit_breaker_armed,
+        next_direct_failures_on_connect_result, next_direct_failures_on_start_error,
+        plan_easysym_candidate_ports_with_profile, prune_p2p_path_memory_table,
+        resolve_hardsym_fast_fallback_budget_with_profile, resolve_p2p_feature_switches,
+        resolve_p2p_path_memory_hint, resolve_warmed_relay_commit_reason,
+        should_commit_warmed_relay, should_record_direct_failure_on_start_error,
+        should_use_legacy_dual_start, P2pFeatureSwitches,
+        P2pPathMemoryEntry, P2P_PATH_KIND_DIRECT, P2P_PATH_KIND_RELAY,
+    };
+    use crate::{NatClassLocal, NatProfile};
+    use hbb_common::rendezvous_proto::NatType;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_is_hardsym_fast_fallback_profile_true() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::HardSym,
+            confidence: 0.9,
+            ..Default::default()
+        };
+        assert!(is_hardsym_fast_fallback_profile(&profile));
+    }
+
+    #[test]
+    fn test_is_hardsym_fast_fallback_profile_low_confidence() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::HardSym,
+            confidence: 0.4,
+            ..Default::default()
+        };
+        assert!(!is_hardsym_fast_fallback_profile(&profile));
+    }
+
+    #[test]
+    fn test_is_hardsym_fast_fallback_profile_wrong_class() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::EasySymInc,
+            confidence: 0.95,
+            ..Default::default()
+        };
+        assert!(!is_hardsym_fast_fallback_profile(&profile));
+    }
+
+    #[test]
+    fn test_path_memory_hit() {
+        let mut table = HashMap::new();
+        table.insert(
+            "fp-a".to_owned(),
+            P2pPathMemoryEntry {
+                path_kind: P2P_PATH_KIND_DIRECT.to_owned(),
+                path_type: "UDP".to_owned(),
+                success_at_unix_ms: 1_000,
+            },
+        );
+        let hint = resolve_p2p_path_memory_hint(&table, "fp-a", 20_000, 60);
+        assert!(hint.is_some());
+        let (entry, age_ms) = hint.unwrap();
+        assert_eq!(entry.path_kind, P2P_PATH_KIND_DIRECT);
+        assert_eq!(entry.path_type, "UDP");
+        assert_eq!(age_ms, 19_000);
+    }
+
+    #[test]
+    fn test_path_memory_expired() {
+        let mut table = HashMap::new();
+        table.insert(
+            "fp-a".to_owned(),
+            P2pPathMemoryEntry {
+                path_kind: P2P_PATH_KIND_RELAY.to_owned(),
+                path_type: "Relay".to_owned(),
+                success_at_unix_ms: 1_000,
+            },
+        );
+        prune_p2p_path_memory_table(&mut table, 70_000, 60);
+        assert!(table.is_empty());
+        let hint = resolve_p2p_path_memory_hint(&table, "fp-a", 70_000, 60);
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_path_memory_overwrite_update() {
+        let mut table = HashMap::new();
+        table.insert(
+            "fp-a".to_owned(),
+            P2pPathMemoryEntry {
+                path_kind: P2P_PATH_KIND_DIRECT.to_owned(),
+                path_type: "TCP".to_owned(),
+                success_at_unix_ms: 1_000,
+            },
+        );
+        table.insert(
+            "fp-a".to_owned(),
+            P2pPathMemoryEntry {
+                path_kind: P2P_PATH_KIND_RELAY.to_owned(),
+                path_type: "Relay".to_owned(),
+                success_at_unix_ms: 2_000,
+            },
+        );
+        let hint = resolve_p2p_path_memory_hint(&table, "fp-a", 3_000, 60).unwrap();
+        assert_eq!(hint.0.path_kind, P2P_PATH_KIND_RELAY);
+        assert_eq!(hint.0.path_type, "Relay");
+        assert_eq!(hint.1, 1_000);
+    }
+
+    #[test]
+    fn test_circuit_breaker_threshold() {
+        assert!(!is_p2p_circuit_breaker_armed(2));
+        assert!(is_p2p_circuit_breaker_armed(3));
+        assert!(is_p2p_circuit_breaker_armed(8));
+    }
+
+    #[test]
+    fn test_direct_failures_v2_trigger_and_recover() {
+        let mut failures = 0;
+        failures = next_direct_failures_on_connect_result(failures, false, true);
+        assert_eq!(failures, 1);
+        failures = next_direct_failures_on_connect_result(failures, false, true);
+        assert_eq!(failures, 2);
+        failures = next_direct_failures_on_connect_result(failures, false, true);
+        assert_eq!(failures, 3);
+        assert!(is_p2p_circuit_breaker_armed(failures));
+
+        failures = next_direct_failures_on_connect_result(failures, true, true);
+        assert_eq!(failures, 0);
+        assert!(!is_p2p_circuit_breaker_armed(failures));
+    }
+
+    #[test]
+    fn test_direct_failures_start_error_cap() {
+        let mut failures = -1;
+        for _ in 0..16 {
+            failures = next_direct_failures_on_start_error(failures, true);
+        }
+        assert_eq!(failures, 8);
+    }
+
+    #[test]
+    fn test_direct_failures_legacy_behavior() {
+        assert_eq!(next_direct_failures_on_connect_result(0, false, false), 1);
+        assert_eq!(next_direct_failures_on_connect_result(7, false, false), 1);
+        assert_eq!(next_direct_failures_on_connect_result(4, true, false), 0);
+        assert_eq!(next_direct_failures_on_start_error(3, false), 3);
+    }
+
+    #[test]
+    fn test_should_record_direct_failure_on_start_error_case() {
+        assert!(should_record_direct_failure_on_start_error(
+            "Failed to connect via relay server: timeout"
+        ));
+        assert!(should_record_direct_failure_on_start_error(
+            "Failed to make direct connection to remote desktop"
+        ));
+        assert!(should_record_direct_failure_on_start_error("Reset by the peer"));
+        assert!(!should_record_direct_failure_on_start_error(
+            "Remote desktop is offline"
+        ));
+        assert!(!should_record_direct_failure_on_start_error("ID does not exist"));
+        assert!(!should_record_direct_failure_on_start_error("Key mismatch"));
+        assert!(!should_record_direct_failure_on_start_error("Incoming only mode"));
+        assert!(!should_record_direct_failure_on_start_error(
+            "license mismatch"
+        ));
+    }
+
+    #[test]
+    fn test_feature_switch_matrix() {
+        assert_eq!(
+            resolve_p2p_feature_switches(false, true, true, true),
+            P2pFeatureSwitches {
+                orchestrator_v2: false,
+                nat_profile_v2: false,
+                easysym_v1: false,
+                path_memory_v1: false,
+            }
+        );
+        assert_eq!(
+            resolve_p2p_feature_switches(true, true, false, true),
+            P2pFeatureSwitches {
+                orchestrator_v2: true,
+                nat_profile_v2: true,
+                easysym_v1: false,
+                path_memory_v1: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resolve_hardsym_fast_fallback_budget_with_profile_case() {
+        let hard_sym = NatProfile {
+            class_local: NatClassLocal::HardSym,
+            confidence: 0.92,
+            ..Default::default()
+        };
+        let got = resolve_hardsym_fast_fallback_budget_with_profile(
+            true,
+            true,
+            Some(&hard_sym),
+            420,
+        )
+        .unwrap();
+        assert_eq!(got.0, 420);
+        assert!((got.1 - 0.92).abs() < f32::EPSILON);
+
+        assert!(
+            resolve_hardsym_fast_fallback_budget_with_profile(false, true, Some(&hard_sym), 420)
+                .is_none()
+        );
+        assert!(
+            resolve_hardsym_fast_fallback_budget_with_profile(true, false, Some(&hard_sym), 420)
+                .is_none()
+        );
+
+        let low_conf = NatProfile {
+            class_local: NatClassLocal::HardSym,
+            confidence: 0.4,
+            ..Default::default()
+        };
+        assert!(
+            resolve_hardsym_fast_fallback_budget_with_profile(true, true, Some(&low_conf), 420)
+                .is_none()
+        );
+        assert!(resolve_hardsym_fast_fallback_budget_with_profile(true, true, None, 420).is_none());
+    }
+
+    #[test]
+    fn test_plan_easysym_candidate_ports_with_profile_case() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::EasySymInc,
+            mapped_port_span: 2,
+            confidence: 0.9,
+            ..Default::default()
+        };
+        let base_port = 40_000;
+        let ports = plan_easysym_candidate_ports_with_profile(
+            base_port,
+            NatType::ASYMMETRIC,
+            Some(&profile),
+            true,
+            true,
+        );
+        assert_eq!(ports[0], base_port);
+        assert!(ports.len() > 1);
+        assert!(ports.contains(&(base_port + 2)));
+
+        assert_eq!(
+            plan_easysym_candidate_ports_with_profile(
+                base_port,
+                NatType::ASYMMETRIC,
+                Some(&profile),
+                false,
+                true,
+            ),
+            vec![base_port]
+        );
+        assert_eq!(
+            plan_easysym_candidate_ports_with_profile(
+                base_port,
+                NatType::ASYMMETRIC,
+                Some(&profile),
+                true,
+                false,
+            ),
+            vec![base_port]
+        );
+        assert_eq!(
+            plan_easysym_candidate_ports_with_profile(
+                base_port,
+                NatType::SYMMETRIC,
+                Some(&profile),
+                true,
+                true,
+            ),
+            vec![base_port]
+        );
+        assert_eq!(
+            plan_easysym_candidate_ports_with_profile(
+                base_port,
+                NatType::ASYMMETRIC,
+                None,
+                true,
+                true,
+            ),
+            vec![base_port]
+        );
+    }
+
+    #[test]
+    fn test_should_use_legacy_dual_start_case() {
+        assert!(!should_use_legacy_dual_start(true, true));
+        assert!(!should_use_legacy_dual_start(true, false));
+        assert!(!should_use_legacy_dual_start(false, false));
+        assert!(should_use_legacy_dual_start(false, true));
+    }
+
+    #[test]
+    fn test_should_commit_warmed_relay_case() {
+        assert!(should_commit_warmed_relay(300, 200, 300, 1000));
+        assert!(should_commit_warmed_relay(100, 1000, 300, 1000));
+        assert!(!should_commit_warmed_relay(120, 400, 300, 1000));
+    }
+
+    #[test]
+    fn test_resolve_warmed_relay_commit_reason_priority() {
+        assert_eq!(
+            resolve_warmed_relay_commit_reason(true, true, true),
+            "hard_sym_fast_fallback_commit"
+        );
+        assert_eq!(
+            resolve_warmed_relay_commit_reason(false, true, true),
+            "path_memory_relay_hint_commit"
+        );
+        assert_eq!(
+            resolve_warmed_relay_commit_reason(false, false, true),
+            "circuit_breaker_fast_commit"
+        );
+        assert_eq!(
+            resolve_warmed_relay_commit_reason(false, false, false),
+            "relay_warmup_commit_after_direct_window"
+        );
+    }
 }

@@ -259,6 +259,10 @@ impl<T: InvokeUiSession> Session<T> {
         self.lc.read().unwrap().version.clone()
     }
 
+    pub fn get_last_relay_reason(&self) -> String {
+        self.lc.read().unwrap().relay_reason.clone()
+    }
+
     pub fn get_trackpad_speed(&self) -> i32 {
         self.lc.read().unwrap().trackpad_speed
     }
@@ -1296,6 +1300,7 @@ impl<T: InvokeUiSession> Session<T> {
             self.lc.write().unwrap().force_relay = true;
         }
         self.lc.write().unwrap().peer_info = None;
+        self.lc.write().unwrap().relay_reason = "".to_owned();
         self.reconnect_count.fetch_add(1, Ordering::SeqCst);
         let mut lock = self.thread.lock().unwrap();
         // No need to join the previous thread, because it will exit automatically.

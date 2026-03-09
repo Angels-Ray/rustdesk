@@ -229,6 +229,15 @@ pub fn session_get_option(session_id: SessionID, arg: String) -> Option<String> 
     }
 }
 
+pub fn session_get_last_relay_reason(session_id: SessionID) -> SyncReturn<String> {
+    let reason = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.get_last_relay_reason()
+    } else {
+        "".to_owned()
+    };
+    SyncReturn(reason)
+}
+
 pub fn session_login(
     session_id: SessionID,
     os_username: String,
@@ -2960,6 +2969,8 @@ pub fn session_get_common(
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
         let v = if key == "is_screenshot_supported" {
             s.is_screenshot_supported().to_string()
+        } else if key == "last_relay_reason" {
+            s.get_last_relay_reason()
         } else {
             "".to_owned()
         };
