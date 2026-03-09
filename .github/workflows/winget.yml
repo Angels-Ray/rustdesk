@@ -5,6 +5,7 @@ on:
   workflow_dispatch:
 jobs:
   publish:
+    if: github.repository == 'rustdesk/rustdesk'
     runs-on: ubuntu-latest
     steps:
       - uses: vedantmgoyal9/winget-releaser@main
