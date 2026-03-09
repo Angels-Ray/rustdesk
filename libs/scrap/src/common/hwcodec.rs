@@ -512,10 +512,10 @@ struct HwCodecConfig2 {
     pub config: String,
 }
 
-// ipc server process start check process once, other process get from ipc server once
-// install: --server start check process, check process send to --server,  ui get from --server
-// portable: ui start check process, check process send to ui
-// sciter and unilink: get from ipc server
+// ipc server process starts the check once, other processes read from ipc server.
+// install: --server starts check process, check process reports to --server, UI reads from --server.
+// portable: UI starts check process, check process reports to UI.
+// desktop integration and unilink: read from ipc server.
 impl HwCodecConfig {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     pub fn set(config: String) {

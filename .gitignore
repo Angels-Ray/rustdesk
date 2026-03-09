@@ -4,7 +4,6 @@
 .idea
 .DS_Store
 .env
-libsciter-gtk.so
 src/ui/inline.rs
 extractor
 __pycache__
@@ -17,7 +16,6 @@ cert.pfx
 *png
 *svg
 *jpg
-sciter.dll
 **pdb
 src/bridge_generated.rs
 src/bridge_generated.io.rs
@@ -54,5 +52,4 @@ examples/**/target/
 # ===
 vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
-libsciter.dylib
 flutter/web/

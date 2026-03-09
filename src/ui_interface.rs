@@ -141,7 +141,7 @@ pub fn get_license() -> String {
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         #[cfg(feature = "flutter")]
         return format!("Key: {}\nHost: {}\nAPI: {}", lic.key, lic.host, lic.api);
-        // default license format is html formed (sciter)
+        // default license format for legacy desktop path is HTML
         #[cfg(not(feature = "flutter"))]
         return format!(
             "<br /> Key: {} <br /> Host: {} API: {}",
@@ -385,7 +385,7 @@ pub fn get_sound_inputs() -> Vec<String> {
 
         let inputs = Arc::new(Mutex::new(Vec::new()));
         let cloned = inputs.clone();
-        // can not call below in UI thread, because conflict with sciter sound com initialization
+        // Can not call below in UI thread due to legacy sound COM initialization conflict.
         std::thread::spawn(move || *cloned.lock().unwrap() = get_sound_inputs_())
             .join()
             .ok();

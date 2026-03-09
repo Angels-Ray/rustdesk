@@ -23,13 +23,7 @@ fn main() {
     feature = "flutter"
 )))]
 fn main() {
-    #[cfg(all(windows, not(feature = "inline")))]
-    unsafe {
-        winapi::um::shellscalingapi::SetProcessDpiAwareness(2);
-    }
-    if let Some(args) = crate::core_main::core_main().as_mut() {
-        ui::start(args);
-    }
+    eprintln!("桌面旧 UI 已移除。请使用 Flutter 路径构建（--features flutter）。");
     common::global_clean();
 }
 

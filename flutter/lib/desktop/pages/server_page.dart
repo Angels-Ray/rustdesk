@@ -1,4 +1,4 @@
-// original cm window in Sciter version.
+// Original connection-manager window implementation.
 
 import 'dart:async';
 import 'dart:math';

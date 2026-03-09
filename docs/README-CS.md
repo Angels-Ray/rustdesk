@@ -24,11 +24,7 @@ Projekt RustDesk vítá přiložení ruky k dílu od každého. Jak začít se d
 
 ## Softwarové součásti, na kterých závisí
 
-Varianta pro počítač používá pro grafické uživatelské rozhraní [sciter](https://sciter.com/) – stáhněte si potřebnou knihovnu.
 
-[Windows](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll) |
-[Linux](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so) |
-[MacOS](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib)
 
 Varianta pro mobilní platformy používá aplikační rámec (framework) Flutter. Na tu také v budoucnu předěláme i variantu pro počítač.
 
@@ -98,8 +94,6 @@ source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
 cd rustdesk
 mkdir -p target/debug
-wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
-mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
 

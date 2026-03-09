@@ -21,11 +21,7 @@ RustDesk toivottaa avustukset tervetulleiksi kaikilta. Katso lisätietoja [`docs
 
 ## Riippuvuudet
 
-Desktop-versiot käyttävät [sciter](https://sciter.com/) graafisena käyttöliittymänä, lataa sciter-dynaaminen kirjasto itsellesi.
 
-[Windows](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.win/x64/sciter.dll) |
-[Linux](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so) |
-[MacOS](https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.osx/libsciter.dylib)
 
 ## Rakentamisaskeleet harppoen
 
@@ -91,8 +87,6 @@ source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
 cd rustdesk
 mkdir -p target/debug
-wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
-mv libsciter-gtk.so target/debug
 VCPKG_ROOT=$HOME/vcpkg cargo run
 ```
 

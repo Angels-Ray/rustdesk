@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Development Commands
 
 ### Build Commands
-- `cargo run` - Build and run the desktop application (requires libsciter library)
+- `cargo run --features flutter` - Build and run Rust backend with Flutter feature enabled
 - `python3 build.py --flutter` - Build Flutter version (desktop)
 - `python3 build.py --flutter --release` - Build Flutter version in release mode
 - `python3 build.py --hwcodec` - Build with hardware codec support
@@ -32,7 +32,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Directory Structure
 - **`src/`** - Main Rust application code
-  - `src/ui/` - Legacy Sciter UI (deprecated, use Flutter instead)
+  - `src/core_main.rs` - Desktop/core startup path
   - `src/server/` - Audio/clipboard/input/video services and network connections
   - `src/client.rs` - Peer connection handling
   - `src/platform/` - Platform-specific code
@@ -51,7 +51,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **File Transfer**: Secure file transfer implementation in `libs/hbb_common/`
 
 ### UI Architecture
-- **Legacy UI**: Sciter-based (deprecated) - files in `src/ui/`
 - **Modern UI**: Flutter-based - files in `flutter/`
   - Desktop: `flutter/lib/desktop/`
   - Mobile: `flutter/lib/mobile/`
@@ -62,7 +61,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### Dependencies
 - Requires vcpkg for C++ dependencies: `libvpx`, `libyuv`, `opus`, `aom`
 - Set `VCPKG_ROOT` environment variable
-- Download appropriate Sciter library for legacy UI support
+- Ensure Flutter SDK is available in `PATH`
 
 ### Ignore Patterns
 When working with files, ignore these directories:
