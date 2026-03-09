@@ -13,6 +13,13 @@ use hbb_common::{
     anyhow::anyhow, bail, config::LocalConfig, get_version_number, log, message_proto::*,
     rendezvous_proto::ConnType, ResultType,
 };
+#[cfg(target_os = "macos")]
+use cocoa::{
+    base::id,
+    foundation::{NSArray, NSURL},
+};
+#[cfg(target_os = "macos")]
+use objc::runtime::{Object, Sel, BOOL, NO};
 use serde::Serialize;
 use serde_json::json;
 #[cfg(target_os = "windows")]
@@ -119,6 +126,35 @@ pub extern "C" fn rustdesk_core_main() -> bool {
 #[no_mangle]
 pub extern "C" fn handle_applicationShouldOpenUntitledFile() {
     crate::platform::macos::handle_application_should_open_untitled_file();
+}
+
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn handle_open_urls(_self: &Object, _cmd: Sel, _: id, urls: id) {
+    use std::ffi::CStr;
+    unsafe {
+        for i in 0..urls.count() {
+            let theurl = CStr::from_ptr(urls.objectAtIndex(i).absoluteString().UTF8String())
+                .to_string_lossy()
+                .into_owned();
+            log::debug!("URL received: {}", theurl);
+            std::thread::spawn(move || crate::handle_url_scheme(theurl));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[no_mangle]
+pub extern "C" fn service_should_handle_reopen(
+    _obj: &Object,
+    _sel: Sel,
+    _sender: id,
+    _has_visible_windows: BOOL,
+) -> BOOL {
+    log::debug!("Invoking the main rustdesk process from reopen delegate");
+    std::thread::spawn(move || crate::handle_url_scheme("".to_string()));
+    // Prevent default logic.
+    NO
 }
 
 #[cfg(windows)]
