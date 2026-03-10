@@ -16,7 +16,7 @@ use hbb_common::{
 #[cfg(target_os = "macos")]
 use cocoa::{
     base::id,
-    foundation::{NSArray, NSURL},
+    foundation::{NSArray, NSURL, NSString},
 };
 #[cfg(target_os = "macos")]
 use objc::runtime::{Object, Sel, BOOL, NO};
