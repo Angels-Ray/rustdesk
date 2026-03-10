@@ -10,6 +10,7 @@ concurrency:
 jobs:
   build:
     uses: ./.github/workflows/flutter-build.yml
+    secrets: inherit
     with:
       upload-artifact: true
       upload-tag: "push-${{ github.run_id }}"
