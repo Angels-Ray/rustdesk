@@ -1,4 +1,6 @@
-#import <UIKit/UIKit.h>
+#pragma once
+
+#import <Cocoa/Cocoa.h>
 #import <objc/objc.h>
 #import <objc/runtime.h>
 
@@ -6,5 +8,4 @@
 typedef id Object;
 typedef SEL Sel;
 
-#import "GeneratedPluginRegistrant.h"
-#import "bridge_generated.h"
+#include "bridge_generated.h"
