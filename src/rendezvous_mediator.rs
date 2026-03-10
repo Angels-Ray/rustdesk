@@ -582,6 +582,16 @@ impl RendezvousMediator {
         let relay = use_ws() || Config::is_proxy() || ph.force_relay;
         let mut socket_addr_v6 = Default::default();
         let control_permissions = ph.control_permissions.into_option();
+        log::info!(
+            "p2p handle_punch_hole: peer_addr={}, udp_port={}, force_relay={}, relay={}, nat_type={:?}, peer_v6_port={}, has_socket_addr_v6={}",
+            peer_addr,
+            ph.udp_port,
+            ph.force_relay,
+            relay,
+            ph.nat_type.enum_value().ok(),
+            peer_addr_v6.port(),
+            !ph.socket_addr_v6.is_empty()
+        );
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(
                 peer_addr_v6,
@@ -603,11 +613,23 @@ impl RendezvousMediator {
             } else {
                 Config::get_nat_type() == NatType::SYMMETRIC as i32
             };
+        let disable_tcp_listen = config::is_disable_tcp_listen();
+        log::info!(
+            "p2p handle_punch_hole decision: peer_symmetric={}, local_hard_symmetric={}, disable_tcp_listen={}, udp_port={}",
+            peer_symmetric,
+            local_hard_symmetric,
+            disable_tcp_listen,
+            ph.udp_port
+        );
         if (peer_symmetric && local_hard_symmetric)
             || relay
-            || (config::is_disable_tcp_listen() && ph.udp_port <= 0)
+            || (disable_tcp_listen && ph.udp_port <= 0)
         {
             let uuid = Uuid::new_v4().to_string();
+            log::info!(
+                "p2p handle_punch_hole: use relay, relay_server={}",
+                relay_server
+            );
             return self
                 .create_relay(
                     ph.socket_addr.into(),
@@ -634,11 +656,19 @@ impl RendezvousMediator {
         };
         if ph.udp_port > 0 {
             peer_addr.set_port(ph.udp_port as u16);
+            log::info!(
+                "p2p handle_punch_hole: use udp, peer_addr={}",
+                peer_addr
+            );
             self.punch_udp_hole(peer_addr, server, msg_punch, control_permissions)
                 .await?;
             return Ok(());
         }
         log::debug!("Punch tcp hole to {:?}", peer_addr);
+        log::info!(
+            "p2p handle_punch_hole: use tcp, peer_addr={}",
+            peer_addr
+        );
         let mut socket = {
             let socket = connect_tcp(&*self.host, CONNECT_TIMEOUT).await?;
             let local_addr = socket.local_addr();
@@ -666,6 +696,13 @@ impl RendezvousMediator {
         let mut msg_out = Message::new();
         msg_out.set_punch_hole_sent(msg_punch);
         let (socket, addr) = new_direct_udp_for(&self.host).await?;
+        let local_addr = socket.local_addr().ok();
+        log::info!(
+            "p2p punch_udp_hole: local_addr={:?}, peer_addr={}, rendezvous={}",
+            local_addr,
+            peer_addr,
+            addr
+        );
         let data = msg_out.write_to_bytes()?;
         socket.send_to(&data, addr).await?;
         let socket_cloned = socket.clone();
@@ -879,43 +916,56 @@ async fn start_ipv6(
     Default::default()
 }
 
-async fn udp_nat_listen(
-    socket: Arc<tokio::net::UdpSocket>,
-    peer_addr: SocketAddr,
-    peer_addr_v4: SocketAddr,
-    server: ServerPtr,
-    control_permissions: Option<ControlPermissions>,
-) -> ResultType<()> {
-    let tm = Instant::now();
-    let socket_cloned = socket.clone();
-    let func = async {
-        socket.connect(peer_addr).await?;
-        let res = crate::punch_udp(socket.clone(), true).await?;
-        let stream = crate::kcp_stream::KcpStream::accept(
-            socket,
-            Duration::from_millis(CONNECT_TIMEOUT as _),
-            res,
-        )
-        .await?;
-        crate::server::create_tcp_connection(
-            server,
-            stream.1,
-            peer_addr_v4,
-            true,
-            control_permissions,
-        )
-        .await?;
-        Ok(())
-    };
-    func.await.map_err(|e: anyhow::Error| {
-        anyhow::anyhow!(
-            "Stop listening on {:?} for remote {peer_addr} with KCP, {:?} elapsed: {e}",
+    async fn udp_nat_listen(
+        socket: Arc<tokio::net::UdpSocket>,
+        peer_addr: SocketAddr,
+        peer_addr_v4: SocketAddr,
+        server: ServerPtr,
+        control_permissions: Option<ControlPermissions>,
+    ) -> ResultType<()> {
+        let tm = Instant::now();
+        let local_addr = socket.local_addr().ok();
+        log::info!(
+            "p2p udp listen start: local_addr={:?}, peer_addr={}, peer_addr_v4={}",
+            local_addr,
+            peer_addr,
+            peer_addr_v4
+        );
+        let socket_cloned = socket.clone();
+        let func = async {
+            socket.connect(peer_addr).await?;
+            let res = crate::punch_udp(socket.clone(), true).await?;
+            let stream = crate::kcp_stream::KcpStream::accept(
+                socket,
+                Duration::from_millis(CONNECT_TIMEOUT as _),
+                res,
+            )
+            .await?;
+            crate::server::create_tcp_connection(
+                server,
+                stream.1,
+                peer_addr_v4,
+                true,
+                control_permissions,
+            )
+            .await?;
+            Ok(())
+        };
+        func.await.map_err(|e: anyhow::Error| {
+            anyhow::anyhow!(
+                "Stop listening on {:?} for remote {peer_addr} with KCP, {:?} elapsed: {e}",
+                socket_cloned.local_addr(),
+                tm.elapsed()
+            )
+        })?;
+        log::info!(
+            "p2p udp listen success: local_addr={:?}, peer_addr={}, elapsed_ms={}",
             socket_cloned.local_addr(),
-            tm.elapsed()
-        )
-    })?;
-    Ok(())
-}
+            peer_addr,
+            tm.elapsed().as_millis()
+        );
+        Ok(())
+    }
 
 // When config is not yet synced from root, register_pk may have already been sent with a new generated pk.
 // After config sync completes, the pk may change. This struct detects pk changes and triggers

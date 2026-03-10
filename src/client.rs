@@ -794,6 +794,14 @@ impl Client {
             udp.0.is_some()
         );
         let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
+        log::info!(
+            "p2p punch request: peer_id={}, punch_type={}, udp_port={}, force_relay={}, has_ipv6_addr={}",
+            peer,
+            punch_type,
+            udp_nat_port,
+            interface.is_force_relay(),
+            ipv6.1.as_ref().map(|v| !v.is_empty()).unwrap_or(false)
+        );
         msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
@@ -849,6 +857,20 @@ impl Client {
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::PunchHoleResponse(ph)) => {
+                        let failure = ph.failure.enum_value().ok();
+                        log::info!(
+                            "p2p punch response detail: socket_addr_present={}, is_udp={}, relay_server={}, nat_type={:?}, is_local={}, feedback={}, failure={:?}, other_failure={}, upnp_port={}, socket_addr_v6_present={}",
+                            !ph.socket_addr.is_empty(),
+                            ph.is_udp,
+                            ph.relay_server,
+                            ph.nat_type(),
+                            ph.is_local(),
+                            ph.feedback,
+                            failure,
+                            ph.other_failure,
+                            ph.upnp_port,
+                            !ph.socket_addr_v6.is_empty()
+                        );
                         if ph.socket_addr.is_empty() {
                             if !ph.other_failure.is_empty() {
                                 bail!(ph.other_failure);
