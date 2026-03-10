@@ -133,6 +133,7 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ matrix.job.flutter }}
+          cache: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -140,10 +141,6 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: ${{ matrix.job.os }}
 
       - name: Install flutter rust bridge deps
         shell: bash
@@ -159,6 +156,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: true
 
       - name: Install vcpkg dependencies
         run: |

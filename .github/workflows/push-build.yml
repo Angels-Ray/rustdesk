@@ -1,0 +1,21 @@
+name: Push Build (Linux/Windows/Android)
+
+on:
+  push:
+
+concurrency:
+  group: push-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/flutter-build.yml
+    with:
+      upload-artifact: true
+      upload-tag: "push-${{ github.run_id }}"
+      build-windows: true
+      build-linux: true
+      build-android: true
+      build-macos: false
+      build-ios: false
+      publish-release: false

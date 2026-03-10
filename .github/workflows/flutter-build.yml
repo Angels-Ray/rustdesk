@@ -9,6 +9,24 @@ on:
       upload-tag:
         type: string
         default: "nightly"
+      build-windows:
+        type: boolean
+        default: true
+      build-linux:
+        type: boolean
+        default: true
+      build-android:
+        type: boolean
+        default: true
+      build-macos:
+        type: boolean
+        default: true
+      build-ios:
+        type: boolean
+        default: true
+      publish-release:
+        type: boolean
+        default: true
 
 # NOTE: F-Droid builder script 'flutter/build_fdroid.sh' reads environment
 # variables from this workflow!
@@ -46,9 +64,11 @@ env:
 
 jobs:
   generate-bridge:
+    if: ${{ inputs.build-windows || inputs.build-linux || inputs.build-android || inputs.build-macos || inputs.build-ios }}
     uses: ./.github/workflows/bridge.yml
 
   build-RustDeskTempTopMostWindow:
+    if: ${{ inputs.build-windows }}
     uses: ./.github/workflows/third-party-RustDeskTempTopMostWindow.yml
     with:
       upload-artifact: ${{ inputs.upload-artifact }}
@@ -61,6 +81,7 @@ jobs:
 
   build-for-windows-flutter:
     name: ${{ matrix.job.target }}
+    if: ${{ inputs.build-windows }}
     needs: [build-RustDeskTempTopMostWindow, generate-bridge]
     runs-on: ${{ matrix.job.os }}
     strategy:
@@ -277,7 +298,7 @@ jobs:
 
       - name: Publish Release
         uses: softprops/action-gh-release@v1
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         with:
           prerelease: true
           tag_name: ${{ env.TAG_NAME }}
@@ -286,7 +307,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ inputs.upload-artifact && secrets.IOS_P12_BASE64 != '' }}
+    if: ${{ inputs.build-ios && inputs.upload-artifact && secrets.IOS_P12_BASE64 != '' }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
@@ -321,7 +342,7 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          cache: true
+          cache: false
 
       - name: Patch flutter
         run: |
@@ -338,7 +359,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-          doNotCache: false
+          doNotCache: true
 
       - name: Install vcpkg dependencies
         run: |
@@ -364,11 +385,6 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: rustdesk-lib-cache-ios
-          key: ${{ matrix.job.target }}
 
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -414,6 +430,7 @@ jobs:
 
   build-for-macOS:
     name: ${{ matrix.job.target }}
+    if: ${{ inputs.build-macos }}
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
     strategy:
@@ -507,7 +524,7 @@ jobs:
         with:
           channel: "stable"
           flutter-version: ${{ env.FLUTTER_VERSION }}
-          cache: true
+          cache: false
 
       - name: Patch flutter
         run: |
@@ -535,10 +552,6 @@ jobs:
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: ${{ matrix.job.os }}
-
       - name: Restore bridge files
         uses: actions/download-artifact@master
         with:
@@ -549,7 +562,7 @@ jobs:
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
-          doNotCache: false
+          doNotCache: true
 
       - name: Install vcpkg dependencies
         run: |
@@ -629,7 +642,7 @@ jobs:
           done
 
       - name: Publish DMG package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -642,7 +655,7 @@ jobs:
       - build-for-macOS
       - build-for-windows-flutter
     runs-on: ubuntu-latest
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.upload-artifact && inputs.publish-release && inputs.build-windows && inputs.build-macos }}
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@master
@@ -667,7 +680,7 @@ jobs:
           tar czf rustdesk-${{ env.VERSION }}-unsigned.tar.gz *.dmg windows-x86_64
 
       - name: Publish unsigned app
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -675,6 +688,7 @@ jobs:
           files: rustdesk-${{ env.VERSION }}-unsigned.tar.gz
 
   build-rustdesk-android:
+    if: ${{ inputs.build-android }}
     needs: [generate-bridge]
     name: build rustdesk android apk ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.os }}
@@ -967,7 +981,7 @@ jobs:
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
-        if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true'
+        if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -976,7 +990,7 @@ jobs:
             ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish unsigned apk package
-        if: env.ANDROID_SIGNING_KEY == '' && env.UPLOAD_ARTIFACT == 'true'
+        if: env.ANDROID_SIGNING_KEY == '' && env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -987,7 +1001,7 @@ jobs:
   build-rustdesk-android-universal:
     needs: [build-rustdesk-android]
     name: build rustdesk android universal apk
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.build-android && inputs.upload-artifact }}
     runs-on: ubuntu-24.04
     env:
       reltype: release
@@ -1169,7 +1183,7 @@ jobs:
           path: ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish signed apk package
-        if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true'
+        if: env.ANDROID_SIGNING_KEY != '' && env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1178,7 +1192,7 @@ jobs:
             ${{steps.sign-rustdesk.outputs.signedReleaseFile}}
 
       - name: Publish unsigned apk package
-        if: env.ANDROID_SIGNING_KEY == '' && env.UPLOAD_ARTIFACT == 'true'
+        if: env.ANDROID_SIGNING_KEY == '' && env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1187,6 +1201,7 @@ jobs:
             signed-apk/rustdesk-${{ env.VERSION }}-universal${{ env.suffix }}.apk
 
   build-rustdesk-linux:
+    if: ${{ inputs.build-linux }}
     needs: [generate-bridge]
     name: build rustdesk linux ${{ matrix.job.target }}
     runs-on: ${{ matrix.job.on }}
@@ -1472,7 +1487,7 @@ jobs:
             done
 
       - name: Publish debian/rpm package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1508,7 +1523,7 @@ jobs:
             cd res && HBB=`pwd`/.. FLUTTER=1 makepkg -f
 
       - name: Publish archlinux package
-        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true'
+        if: matrix.job.arch == 'x86_64' && env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1520,7 +1535,7 @@ jobs:
     name: Build appimage ${{ matrix.job.target }}
     needs: [build-rustdesk-linux]
     runs-on: ubuntu-22.04
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.build-linux && inputs.upload-artifact }}
     strategy:
       fail-fast: false
       matrix:
@@ -1558,7 +1573,7 @@ jobs:
           sudo appimage-builder --skip-tests --recipe ./AppImageBuilder-${{ matrix.job.arch }}.yml
 
       - name: Publish appimage package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1571,7 +1586,7 @@ jobs:
     needs:
       - build-rustdesk-linux
     runs-on: ${{ matrix.job.on }}
-    if: ${{ inputs.upload-artifact }}
+    if: ${{ inputs.build-linux && inputs.upload-artifact }}
     strategy:
       fail-fast: false
       matrix:
@@ -1636,7 +1651,7 @@ jobs:
             flatpak build-bundle ./repo rustdesk-${{ env.VERSION }}-${{ matrix.job.arch }}${{ matrix.job.suffix }}.flatpak com.rustdesk.RustDesk
 
       - name: Publish flatpak package
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
@@ -1716,7 +1731,7 @@ jobs:
           popd
 
       - name: Publish web
-        if: env.UPLOAD_ARTIFACT == 'true'
+        if: env.UPLOAD_ARTIFACT == 'true' && inputs.publish-release
         uses: softprops/action-gh-release@v1
         with:
           prerelease: true
