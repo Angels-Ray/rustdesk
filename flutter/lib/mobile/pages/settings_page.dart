@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:get/get.dart';
@@ -762,6 +763,8 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           if (isAndroid && !outgoingOnly && !_isUsingPublicServer)
             SettingsTile.switchTile(
               title: Text(translate('Disable UDP')),
+              description:
+                  Text(translate('Disable UDP completely. Use TCP/relay only.')),
               initialValue: _disableUdp,
               onToggle: isOptionFixed(kOptionDisableUdp)
                   ? null
@@ -774,32 +777,6 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                         _disableUdp = newValue;
                       });
                     },
-            ),
-          if (!incomingOnly)
-            SettingsTile.switchTile(
-              title: Text(translate('Enable UDP hole punching')),
-              initialValue: _enableUdpPunch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
-                setState(() {
-                  _enableUdpPunch = newValue;
-                });
-              },
-            ),
-          if (!incomingOnly)
-            SettingsTile.switchTile(
-              title: Text(translate('Enable IPv6 P2P connection')),
-              initialValue: _enableIpv6Punch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
-                setState(() {
-                  _enableIpv6Punch = newValue;
-                });
-              },
             ),
           SettingsTile(
               title: Text(translate('Language')),
@@ -851,6 +828,170 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
               },
             ),
         ]),
+        if (!incomingOnly)
+          SettingsSection(title: Text(translate('P2P')), tiles: [
+            SettingsTile.switchTile(
+              title: Text(translate('UDP Punch')),
+              description:
+                  Text(translate('Prefer UDP direct. Disable to always relay. Default on.')),
+              initialValue: _enableUdpPunch,
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
+                final newValue =
+                    mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
+                setState(() {
+                  _enableUdpPunch = newValue;
+                });
+              },
+            ),
+            SettingsTile.switchTile(
+              title: Text(translate('IPv6 Punch')),
+              description:
+                  Text(translate('Allow IPv6 direct attempt. IPv6 unavailable does not affect IPv4.')),
+              initialValue: _enableIpv6Punch,
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
+                final newValue =
+                    mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
+                setState(() {
+                  _enableIpv6Punch = newValue;
+                });
+              },
+            ),
+            _p2pNumberTile(
+              title: 'Direct budget',
+              description:
+                  'Direct total budget. Too small forces relay. Default 8000ms. Range 1000-60000.',
+              optionKey: kOptionP2pDirectBudgetMs,
+              min: 1000,
+              max: 60000,
+              unit: 'ms',
+            ),
+            _p2pNumberTile(
+              title: 'Direct grace',
+              description:
+                  'Direct grace window. Relay is not committed within this window. Default 600ms. Range 100-5000.',
+              optionKey: kOptionP2pDirectGraceMs,
+              min: 100,
+              max: 5000,
+              unit: 'ms',
+            ),
+            _p2pNumberTile(
+              title: 'Relay deadline',
+              description: 'Relay commit deadline. Default 1800ms. Range 200-10000.',
+              optionKey: kOptionP2pRelayCommitDeadlineMs,
+              min: 200,
+              max: 10000,
+              unit: 'ms',
+            ),
+            _p2pNumberTile(
+              title: 'UDP wait min',
+              description:
+                  'UDP port ready min. Actual wait is RTT/2 clamped. Default 250ms. Range 50-5000.',
+              optionKey: kOptionP2pUdpPortReadyMinMs,
+              min: 50,
+              max: 5000,
+              unit: 'ms',
+            ),
+            _p2pNumberTile(
+              title: 'UDP wait max',
+              description:
+                  'UDP port ready max. Actual wait is RTT/2 clamped. Default 1200ms. Range 50-5000.',
+              optionKey: kOptionP2pUdpPortReadyMaxMs,
+              min: 50,
+              max: 5000,
+              unit: 'ms',
+            ),
+            _p2pNumberTile(
+              title: 'UDP budget',
+              description: 'UDP probe packet budget. Default 32. Range 4-256.',
+              optionKey: kOptionP2pUdpBudgetPackets,
+              min: 4,
+              max: 256,
+            ),
+            _p2pNumberTile(
+              title: 'EasySym window',
+              description: 'EasySym prediction window. Default 7. Range 1-32.',
+              optionKey: kOptionP2pEasysymWindow,
+              min: 1,
+              max: 32,
+            ),
+            _p2pNumberTile(
+              title: 'HardSym fallback',
+              description:
+                  'HardSym fast fallback threshold. Default 300ms. Range 100-5000.',
+              optionKey: kOptionP2pHardSymFastFallbackMs,
+              min: 100,
+              max: 5000,
+              unit: 'ms',
+            ),
+            _p2pNumberTile(
+              title: 'Path memory',
+              description: 'Path cache TTL. Default 60s. Range 5-3600.',
+              optionKey: kOptionP2pPathCacheTtlSec,
+              min: 5,
+              max: 3600,
+              unit: 's',
+            ),
+            _p2pNumberTile(
+              title: 'Circuit breaker',
+              description:
+                  'Direct failure threshold for circuit breaker. Default 3. Range 1-10.',
+              optionKey: kOptionP2pCircuitBreakFailures,
+              min: 1,
+              max: 10,
+            ),
+            SettingsTile.switchTile(
+              title: Text(translate('Orchestrator v2')),
+              description:
+                  Text(translate('New connection orchestrator. Disable to fallback legacy.')),
+              initialValue: mainGetLocalBoolOptionSync(kOptionP2pOrchestratorV2),
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(kOptionP2pOrchestratorV2, v);
+                setState(() {});
+              },
+            ),
+            SettingsTile.switchTile(
+              title: Text(translate('NAT profile')),
+              description:
+                  Text(translate('Enable local NAT profile strategy. Disable to fallback legacy.')),
+              initialValue: mainGetLocalBoolOptionSync(kOptionP2pNatProfileV2),
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(kOptionP2pNatProfileV2, v);
+                setState(() {});
+              },
+            ),
+            SettingsTile.switchTile(
+              title: Text(translate('EasySym')),
+              description: Text(translate('Enable EasySym predicted ports.')),
+              initialValue: mainGetLocalBoolOptionSync(kOptionP2pEasysymV1),
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(kOptionP2pEasysymV1, v);
+                setState(() {});
+              },
+            ),
+            SettingsTile.switchTile(
+              title: Text(translate('Path memory')),
+              description: Text(translate('Enable path memory and failure hints.')),
+              initialValue: mainGetLocalBoolOptionSync(kOptionP2pPathMemoryV1),
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(kOptionP2pPathMemoryV1, v);
+                setState(() {});
+              },
+            ),
+            SettingsTile.switchTile(
+              title: Text(translate('Non-public default')),
+              description:
+                  Text(translate('Non-public relay default disables UDP/IPv6 when unset.')),
+              initialValue: mainGetLocalBoolOptionSync(
+                  kOptionP2pLegacyNonPublicUdpDefault),
+              onToggle: (v) async {
+                await mainSetLocalBoolOption(
+                    kOptionP2pLegacyNonPublicUdpDefault, v);
+                setState(() {});
+              },
+            ),
+          ]),
         if (isAndroid)
           SettingsSection(title: Text(translate('Hardware Codec')), tiles: [
             SettingsTile.switchTile(
@@ -996,6 +1137,95 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
       return false;
     }
     return true;
+  }
+
+  SettingsTile _p2pNumberTile({
+    required String title,
+    required String description,
+    required String optionKey,
+    required int min,
+    required int max,
+    String unit = '',
+  }) {
+    String currentValue() {
+      final raw = bind.mainGetLocalOption(key: optionKey);
+      if (raw.isEmpty) {
+        return translate('Default');
+      }
+      return unit.isEmpty ? raw : '$raw$unit';
+    }
+
+    void showDialog() {
+      final controller =
+          TextEditingController(text: bind.mainGetLocalOption(key: optionKey));
+      String errorText = '';
+      gFFI.dialogManager.show((setState, close, context) {
+        Future<void> applyValue(String value) async {
+          await bind.mainSetLocalOption(key: optionKey, value: value);
+          close();
+          this.setState(() {});
+        }
+
+        submit() async {
+          final text = controller.text.trim();
+          if (text.isEmpty) {
+            await applyValue('');
+            return;
+          }
+          final v = int.tryParse(text);
+          if (v == null || v < min || v > max) {
+            setState(() {
+              errorText =
+                  '${translate('Invalid value')} ($min-$max${unit.isEmpty ? '' : unit})';
+            });
+            return;
+          }
+          await applyValue(v.toString());
+        }
+
+        clear() async {
+          await applyValue('');
+        }
+
+        return CustomAlertDialog(
+          title: Text(translate(title)),
+          content: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: controller,
+                keyboardType: TextInputType.number,
+                inputFormatters: [
+                  FilteringTextInputFormatter.allow(RegExp(r'^[0-9]+$')),
+                ],
+                decoration: InputDecoration(
+                  errorText: errorText.isNotEmpty ? errorText : null,
+                  hintText: translate('Empty = default'),
+                ),
+              ),
+              SizedBox(height: 8),
+              Text(translate(description)),
+            ],
+          ),
+          actions: [
+            dialogButton('Clear', onPressed: clear, isOutline: true),
+            dialogButton('Cancel', onPressed: close, isOutline: true),
+            dialogButton('OK', onPressed: submit),
+          ],
+        );
+      }, backDismiss: true, clickMaskDismiss: true);
+    }
+
+    return SettingsTile(
+      title: Text(translate(title)),
+      description: Text(translate(description)),
+      value: Padding(
+        padding: EdgeInsets.symmetric(vertical: 8),
+        child: Text(currentValue()),
+      ),
+      onPressed:
+          isOptionFixed(optionKey) ? null : (context) => showDialog(),
+    );
   }
 
   defaultDisplaySection() {
