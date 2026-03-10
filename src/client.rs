@@ -448,23 +448,54 @@ impl Client {
         }
 
         let (stop_udp_tx, stop_udp_rx) = oneshot::channel::<()>();
+        let udp_punch_enabled = crate::get_udp_punch_enabled();
+        let udp_disabled = crate::is_udp_disabled();
+        let force_relay = interface.is_force_relay();
+        log::info!(
+            "p2p udp settings: disable_udp={}, enable_udp_punch={}, force_relay={}",
+            udp_disabled,
+            udp_punch_enabled,
+            force_relay
+        );
         let udp =
         // no need to care about multiple rendezvous servers case, since it is acutally not used any more.
         // Shared state for UDP NAT test result
-        if crate::get_udp_punch_enabled() && !interface.is_force_relay() {
-            if let Ok((socket, addr)) = new_direct_udp_for(&rendezvous_server).await {
-                let udp_port = Arc::new(Mutex::new(0));
-                let up_cloned = udp_port.clone();
-                let socket_cloned = socket.clone();
-                let func = async move {
-                    allow_err!(test_udp_uat(socket_cloned, addr, up_cloned, stop_udp_rx).await);
-                };
-                tokio::spawn(func);
-                (Some(socket), Some(udp_port))
-            } else {
-                (None, None)
+        if udp_punch_enabled && !force_relay {
+            match new_direct_udp_for(&rendezvous_server).await {
+                Ok((socket, addr)) => {
+                    if let Ok(local) = socket.local_addr() {
+                        log::info!(
+                            "p2p udp nat test socket ready: local={}, rendezvous={}",
+                            local,
+                            addr
+                        );
+                    } else {
+                        log::info!("p2p udp nat test socket ready: rendezvous={}", addr);
+                    }
+                    let udp_port = Arc::new(Mutex::new(0));
+                    let up_cloned = udp_port.clone();
+                    let socket_cloned = socket.clone();
+                    let func = async move {
+                        allow_err!(test_udp_uat(socket_cloned, addr, up_cloned, stop_udp_rx).await);
+                    };
+                    tokio::spawn(func);
+                    (Some(socket), Some(udp_port))
+                }
+                Err(err) => {
+                    log::warn!(
+                        "p2p udp nat test socket create failed for {}: {}",
+                        rendezvous_server,
+                        err
+                    );
+                    (None, None)
+                }
             }
         } else {
+            log::info!(
+                "p2p udp nat test skipped: enable_udp_punch={}, force_relay={}",
+                udp_punch_enabled,
+                force_relay
+            );
             (None, None)
         };
         let fut = Self::_start_inner(
@@ -757,6 +788,11 @@ impl Client {
             (None, None)
         };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
+        log::info!(
+            "p2p udp nat port result: port={}, udp_socket_present={}",
+            udp_nat_port,
+            udp.0.is_some()
+        );
         let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
         msg_out.set_punch_hole_request(PunchHoleRequest {
             id: peer.to_owned(),
@@ -839,12 +875,22 @@ impl Client {
                             relay_server = ph.relay_server;
                             peer_addr = AddrMangle::decode(&ph.socket_addr);
                             feedback = ph.feedback;
+                            log::info!(
+                                "p2p punch response: is_udp={}, peer_addr={}, udp_socket_present={}",
+                                ph.is_udp,
+                                peer_addr,
+                                udp.0.is_some()
+                            );
                             let s = udp.0.take();
                             if ph.is_udp && s.is_some() {
                                 if let Some(s) = s {
                                     allow_err!(s.connect(peer_addr).await);
                                     udp.0 = Some(s);
                                 }
+                            } else if s.is_some() {
+                                log::info!(
+                                    "p2p punch response not udp, drop udp socket; udp direct attempt will be skipped"
+                                );
                             }
                             let s = ipv6.0.take();
                             if !ph.socket_addr_v6.is_empty() && s.is_some() {
@@ -1221,6 +1267,7 @@ impl Client {
             }
             .boxed(),
         );
+        let has_udp_socket_nat = udp_socket_nat.is_some();
         if let Some(udp_socket_nat) = udp_socket_nat {
             if easysym_v1_enabled {
                 let easysym_candidate_ports = plan_easysym_candidate_ports(peer, peer_nat_type);
@@ -1271,6 +1318,9 @@ impl Client {
                     .boxed(),
                 );
             }
+        }
+        if !has_udp_socket_nat {
+            log::info!("p2p udp direct skipped: udp_socket_nat=None");
         }
         if let Some(udp_socket_v6) = udp_socket_v6 {
             connect_futures.push(
@@ -5206,6 +5256,12 @@ async fn test_udp_uat(
     udp_port: Arc<Mutex<u16>>,
     mut stop_udp_rx: oneshot::Receiver<()>,
 ) -> ResultType<()> {
+    let local_addr = udp_socket.local_addr().ok();
+    log::info!(
+        "p2p udp nat test start: local_addr={:?}, rendezvous={}",
+        local_addr,
+        server_addr
+    );
     let (tx, mut rx) = oneshot::channel::<_>();
     tokio::spawn(async {
         if let Ok(v) = crate::test_nat_ipv4().await {
@@ -5302,6 +5358,11 @@ async fn test_udp_uat(
     }
 
     let final_port = *udp_port.lock().unwrap();
+    log::info!(
+        "p2p udp nat test result: port={}, success={}",
+        final_port,
+        final_port > 0
+    );
     log::debug!(
         "UDP NAT test to {:?} finished: time={:?}, port={}, packets_sent={}, packet_budget={}, success={}",
         server_addr,
@@ -5321,6 +5382,16 @@ async fn udp_nat_connect_with_reserved_budget(
     ms_timeout: u64,
     packet_budget: usize,
 ) -> ResultType<(Stream, Option<KcpStream>, &'static str)> {
+    let peer_addr = socket.peer_addr().ok();
+    let local_addr = socket.local_addr().ok();
+    log::info!(
+        "p2p udp direct start: typ={}, peer_addr={:?}, local_addr={:?}, timeout_ms={}, packet_budget={}",
+        typ,
+        peer_addr,
+        local_addr,
+        ms_timeout,
+        packet_budget
+    );
     crate::punch_udp_with_constraints(
         socket.clone(),
         false,
@@ -5352,6 +5423,10 @@ async fn udp_nat_connect(
     let reserved_packets =
         reserve_udp_packet_budget(&shared_udp_packet_budget, reserve_packets.max(1));
     if reserved_packets == 0 {
+        log::info!(
+            "p2p udp direct skipped: packet budget exhausted (typ={})",
+            typ
+        );
         bail!("UDP packet budget exhausted");
     }
     udp_nat_connect_with_reserved_budget(socket, typ, ms_timeout, reserved_packets).await
