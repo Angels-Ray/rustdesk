@@ -5360,7 +5360,8 @@ async fn udp_nat_connect(
 #[cfg(test)]
 mod p2p_nat_strategy_tests {
     use super::{
-        is_hardsym_fast_fallback_profile, is_p2p_circuit_breaker_armed,
+        get_p2p_circuit_breaker_threshold, is_hardsym_fast_fallback_profile,
+        is_p2p_circuit_breaker_armed,
         next_direct_failures_on_connect_result, next_direct_failures_on_start_error,
         plan_easysym_candidate_ports_with_profile, prune_p2p_path_memory_table,
         reserve_udp_packet_budget,
@@ -5484,9 +5485,10 @@ mod p2p_nat_strategy_tests {
 
     #[test]
     fn test_circuit_breaker_threshold() {
-        assert!(!is_p2p_circuit_breaker_armed(2));
-        assert!(is_p2p_circuit_breaker_armed(3));
-        assert!(is_p2p_circuit_breaker_armed(8));
+        let threshold = get_p2p_circuit_breaker_threshold();
+        assert!(!is_p2p_circuit_breaker_armed((threshold - 1).max(0)));
+        assert!(is_p2p_circuit_breaker_armed(threshold));
+        assert!(is_p2p_circuit_breaker_armed(threshold + 3));
     }
 
     #[test]
@@ -5506,13 +5508,12 @@ mod p2p_nat_strategy_tests {
 
     #[test]
     fn test_direct_failures_v2_trigger_and_recover() {
+        let threshold = get_p2p_circuit_breaker_threshold();
         let mut failures = 0;
-        failures = next_direct_failures_on_connect_result(failures, false, true);
-        assert_eq!(failures, 1);
-        failures = next_direct_failures_on_connect_result(failures, false, true);
-        assert_eq!(failures, 2);
-        failures = next_direct_failures_on_connect_result(failures, false, true);
-        assert_eq!(failures, 3);
+        for i in 1..=threshold {
+            failures = next_direct_failures_on_connect_result(failures, false, true);
+            assert_eq!(failures, i);
+        }
         assert!(is_p2p_circuit_breaker_armed(failures));
 
         failures = next_direct_failures_on_connect_result(failures, true, true);
