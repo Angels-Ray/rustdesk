@@ -71,6 +71,9 @@ const UDP_PORT_READY_ABS_MAX_MS: u64 = 5000;
 const DEFAULT_P2P_DIRECT_BUDGET_MS: u64 = 8000;
 const P2P_DIRECT_BUDGET_MIN_MS: u64 = 1000;
 const P2P_DIRECT_BUDGET_MAX_MS: u64 = 60000;
+const DEFAULT_P2P_DIRECT_GRACE_MS: u64 = 600;
+const P2P_DIRECT_GRACE_MIN_MS: u64 = 100;
+const P2P_DIRECT_GRACE_MAX_MS: u64 = 5000;
 const DEFAULT_P2P_RELAY_COMMIT_DEADLINE_MS: u64 = 1800;
 const P2P_RELAY_COMMIT_DEADLINE_MIN_MS: u64 = 200;
 const P2P_RELAY_COMMIT_DEADLINE_MAX_MS: u64 = 10000;
@@ -86,6 +89,9 @@ const P2P_HARDSYM_FAST_FALLBACK_MAX_MS: u64 = 5000;
 const DEFAULT_P2P_PATH_CACHE_TTL_SEC: u64 = 60;
 const P2P_PATH_CACHE_TTL_MIN_SEC: u64 = 5;
 const P2P_PATH_CACHE_TTL_MAX_SEC: u64 = 3600;
+const DEFAULT_P2P_CIRCUIT_BREAK_FAILURES: u64 = 3;
+const P2P_CIRCUIT_BREAK_FAILURES_MIN: u64 = 1;
+const P2P_CIRCUIT_BREAK_FAILURES_MAX: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NatClassLocal {
@@ -113,6 +119,7 @@ pub struct NatProfile {
     pub class_local: NatClassLocal,
     pub mapped_ip_count: u8,
     pub mapped_port_span: u16,
+    pub mapped_port_step: u16,
     pub mapping_varies_by_dest: bool,
     pub port_trend: i8,
     pub port_stability: f32,
@@ -128,6 +135,7 @@ impl Default for NatProfile {
             class_local: NatClassLocal::Unknown,
             mapped_ip_count: 0,
             mapped_port_span: 0,
+            mapped_port_step: 0,
             mapping_varies_by_dest: false,
             port_trend: 0,
             port_stability: 0.0,
@@ -675,6 +683,7 @@ pub fn update_nat_profile(mut profile: NatProfile) {
             "mapping_varies_by_dest": profile.mapping_varies_by_dest,
             "mapped_ip_count": profile.mapped_ip_count,
             "mapped_port_span": profile.mapped_port_span,
+            "mapped_port_step": profile.mapped_port_step,
             "port_trend": profile.port_trend,
             "port_stability": profile.port_stability,
             "udp_reachability": profile.udp_reachability,
@@ -685,7 +694,7 @@ pub fn update_nat_profile(mut profile: NatProfile) {
 }
 
 pub fn fold_nat_profile_to_nat_type(profile: &NatProfile) -> NatType {
-    if profile.confidence < 0.3 {
+    if profile.confidence < 0.5 {
         return NatType::UNKNOWN_NAT;
     }
     match profile.class_local {
@@ -712,6 +721,185 @@ impl Drop for CheckTestNatType {
             test_nat_type();
         }
     }
+}
+
+#[inline]
+fn sign_i32(v: i32) -> i8 {
+    if v > 0 {
+        1
+    } else if v < 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn resolve_port_trend_and_step(ports: &[i32]) -> Option<(i8, u16, f32)> {
+    let deltas: Vec<i32> = ports
+        .windows(2)
+        .filter_map(|w| {
+            if w.len() == 2 && w[0] > 0 && w[1] > 0 {
+                Some(w[1] - w[0])
+            } else {
+                None
+            }
+        })
+        .collect();
+    if deltas.is_empty() {
+        return None;
+    }
+    let positives = deltas.iter().filter(|&&d| d > 0).count();
+    let negatives = deltas.iter().filter(|&&d| d < 0).count();
+    let trend = if positives == deltas.len() {
+        1
+    } else if negatives == deltas.len() {
+        -1
+    } else {
+        0
+    };
+    let steps: Vec<i32> = deltas.iter().map(|d| d.abs()).collect();
+    let step = (steps.iter().sum::<i32>() as f32 / steps.len() as f32)
+        .round()
+        .max(1.0) as i32;
+    let base_step = steps[0];
+    let stable_count = steps
+        .iter()
+        .filter(|&&v| (v - base_step).abs() <= 1)
+        .count();
+    Some((
+        trend,
+        step.clamp(1, u16::MAX as i32) as u16,
+        stable_count as f32 / steps.len() as f32,
+    ))
+}
+
+fn classify_nat_profile_from_ports(
+    server1_ports: &[i32],
+    server2_ports: &[i32],
+    ipv6_ready: bool,
+) -> Option<(NatType, NatProfile)> {
+    if server1_ports.is_empty() || server2_ports.is_empty() {
+        return None;
+    }
+    let mut all_ports: Vec<i32> = server1_ports
+        .iter()
+        .chain(server2_ports.iter())
+        .copied()
+        .filter(|p| *p > 0)
+        .collect();
+    if all_ports.is_empty() {
+        return None;
+    }
+    all_ports.sort_unstable();
+    let mapped_port_span = all_ports.last()?.abs_diff(*all_ports.first()?) as u16;
+    let all_same = all_ports.windows(2).all(|w| w[0] == w[1]);
+    if all_same {
+        return Some((
+            NatType::ASYMMETRIC,
+            NatProfile {
+                class_local: NatClassLocal::Cone,
+                mapped_ip_count: 1,
+                mapped_port_span: 0,
+                mapped_port_step: 0,
+                mapping_varies_by_dest: false,
+                port_trend: 0,
+                port_stability: 1.0,
+                udp_reachability: 1.0,
+                ipv6_ready,
+                confidence: 0.95,
+                sampled_at_unix_ms: now_unix_ms(),
+            },
+        ));
+    }
+
+    let rounds = std::cmp::min(server1_ports.len(), server2_ports.len());
+    let valid_rounds = (0..rounds)
+        .filter(|idx| server1_ports[*idx] > 0 && server2_ports[*idx] > 0)
+        .count();
+    let mapping_varies_by_dest = (0..rounds).any(|idx| {
+        let p1 = server1_ports[idx];
+        let p2 = server2_ports[idx];
+        p1 > 0 && p2 > 0 && p1 != p2
+    });
+    if valid_rounds < 2 {
+        return Some((
+            NatType::UNKNOWN_NAT,
+            NatProfile {
+                class_local: NatClassLocal::Unknown,
+                mapped_ip_count: 1,
+                mapped_port_span: mapped_port_span.max(1),
+                mapped_port_step: 0,
+                mapping_varies_by_dest,
+                port_trend: 0,
+                port_stability: 0.0,
+                udp_reachability: 1.0,
+                ipv6_ready,
+                confidence: 0.45,
+                sampled_at_unix_ms: now_unix_ms(),
+            },
+        ));
+    }
+    let trend_a = resolve_port_trend_and_step(server1_ports);
+    let trend_b = resolve_port_trend_and_step(server2_ports);
+
+    let (class_local, confidence, port_trend, port_stability, mapped_port_step) =
+        match (trend_a, trend_b) {
+        (Some((trend1, step1, stability1)), Some((trend2, step2, stability2)))
+            if trend1 != 0
+                && trend1 == trend2
+                && stability1 >= 0.6
+                && stability2 >= 0.6
+                && step1.max(step2) <= 32
+                && step1.abs_diff(step2) <= 4
+                && mapped_port_span <= 192 =>
+        {
+            let class_local = if trend1 > 0 {
+                NatClassLocal::EasySymInc
+            } else {
+                NatClassLocal::EasySymDec
+            };
+            let step = ((step1 as u32 + step2 as u32) / 2).max(1).min(u16::MAX as u32) as u16;
+            (class_local, 0.82, trend1, stability1.min(stability2), step)
+        }
+        (Some((trend1, _, stability1)), Some((trend2, _, stability2))) => (
+            NatClassLocal::HardSym,
+            0.74,
+            if sign_i32(trend1 as i32) == sign_i32(trend2 as i32) {
+                trend1
+            } else {
+                0
+            },
+            stability1.min(stability2) * 0.7,
+            0,
+        ),
+        _ => (NatClassLocal::Unknown, 0.45, 0, 0.3, 0),
+    };
+    let nat_type = if matches!(
+        class_local,
+        NatClassLocal::Cone | NatClassLocal::EasySymInc | NatClassLocal::EasySymDec
+    ) {
+        NatType::ASYMMETRIC
+    } else if class_local == NatClassLocal::HardSym {
+        NatType::SYMMETRIC
+    } else {
+        NatType::UNKNOWN_NAT
+    };
+    Some((
+        nat_type,
+        NatProfile {
+            class_local,
+            mapped_ip_count: 1,
+            mapped_port_span: mapped_port_span.max(1),
+            mapped_port_step,
+            mapping_varies_by_dest,
+            port_trend,
+            port_stability,
+            udp_reachability: 1.0,
+            ipv6_ready,
+            confidence,
+            sampled_at_unix_ms: now_unix_ms(),
+        },
+    ))
 }
 
 pub fn test_nat_type() {
@@ -774,67 +962,65 @@ async fn test_nat_type_() -> ResultType<bool> {
         serial,
         ..Default::default()
     });
-    let mut port1 = 0;
-    let mut port2 = 0;
+    let mut sampled_ports = [Vec::<i32>::new(), Vec::<i32>::new()];
     let mut local_addr = None;
-    for i in 0..2 {
-        let server = if i == 0 { &*server1 } else { &*server2 };
-        let mut socket =
-            socket_client::connect_tcp_local(server, local_addr, CONNECT_TIMEOUT).await?;
-        if i == 0 {
-            // reuse the local addr is required for nat test
-            local_addr = Some(socket.local_addr());
-            Config::set_option(
-                "local-ip-addr".to_owned(),
-                socket.local_addr().ip().to_string(),
-            );
-        }
-        socket.send(&msg_out).await?;
-        if let Some(msg_in) = get_next_nonkeyexchange_msg(&mut socket, None).await {
-            if let Some(rendezvous_message::Union::TestNatResponse(tnr)) = msg_in.union {
-                log::debug!("Got nat response from {}: port={}", server, tnr.port);
-                if i == 0 {
-                    port1 = tnr.port;
-                } else {
-                    port2 = tnr.port;
-                }
-                if let Some(cu) = tnr.cu.as_ref() {
-                    Config::set_option(
-                        "rendezvous-servers".to_owned(),
-                        cu.rendezvous_servers.join(","),
-                    );
-                    Config::set_serial(cu.serial);
-                }
+    for _round in 0..2 {
+        for i in 0..2 {
+            let server = if i == 0 { &*server1 } else { &*server2 };
+            let mut socket =
+                socket_client::connect_tcp_local(server, local_addr, CONNECT_TIMEOUT).await?;
+            if local_addr.is_none() {
+                // reuse the local addr is required for nat test
+                local_addr = Some(socket.local_addr());
+                Config::set_option(
+                    "local-ip-addr".to_owned(),
+                    socket.local_addr().ip().to_string(),
+                );
             }
-        } else {
-            break;
+            socket.send(&msg_out).await?;
+            if let Some(msg_in) = get_next_nonkeyexchange_msg(&mut socket, None).await {
+                if let Some(rendezvous_message::Union::TestNatResponse(tnr)) = msg_in.union {
+                    log::debug!("Got nat response from {}: port={}", server, tnr.port);
+                    if tnr.port > 0 {
+                        sampled_ports[i].push(tnr.port);
+                    }
+                    if let Some(cu) = tnr.cu.as_ref() {
+                        Config::set_option(
+                            "rendezvous-servers".to_owned(),
+                            cu.rendezvous_servers.join(","),
+                        );
+                        Config::set_serial(cu.serial);
+                    }
+                }
+            } else {
+                break;
+            }
         }
     }
-    let ok = port1 > 0 && port2 > 0;
+    let mut ok = !sampled_ports[0].is_empty() && !sampled_ports[1].is_empty();
     if ok {
-        let t = if port1 == port2 {
-            NatType::ASYMMETRIC
+        let ipv6_ready = get_ipv6_socket().await.is_some();
+        if let Some((raw_t, profile)) =
+            classify_nat_profile_from_ports(&sampled_ports[0], &sampled_ports[1], ipv6_ready)
+        {
+            let t = fold_nat_profile_to_nat_type(&profile);
+            Config::set_nat_type(t as _);
+            let class_local = profile.class_local.as_str();
+            let confidence = profile.confidence;
+            update_nat_profile(profile);
+            log::info!(
+                "Tested nat type: {:?} (raw={:?}), class={}, samples={:?}/{:?}, confidence={} in {:?}",
+                t,
+                raw_t,
+                class_local,
+                sampled_ports[0],
+                sampled_ports[1],
+                confidence,
+                start.elapsed()
+            );
         } else {
-            NatType::SYMMETRIC
-        };
-        Config::set_nat_type(t as _);
-        update_nat_profile(NatProfile {
-            class_local: if t == NatType::ASYMMETRIC {
-                NatClassLocal::Cone
-            } else {
-                NatClassLocal::HardSym
-            },
-            mapped_ip_count: 1,
-            mapped_port_span: port1.abs_diff(port2) as u16,
-            mapping_varies_by_dest: t == NatType::SYMMETRIC,
-            port_trend: 0,
-            port_stability: if t == NatType::ASYMMETRIC { 1.0 } else { 0.0 },
-            udp_reachability: 1.0,
-            ipv6_ready: get_ipv6_socket().await.is_some(),
-            confidence: 0.9,
-            sampled_at_unix_ms: now_unix_ms(),
-        });
-        log::info!("Tested nat type: {:?} in {:?}", t, start.elapsed());
+            ok = false;
+        }
     }
     Ok(ok)
 }
@@ -1332,6 +1518,15 @@ pub fn get_p2p_direct_budget_ms() -> u64 {
     )
 }
 
+pub fn get_p2p_direct_grace_ms() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_DIRECT_GRACE_MS)),
+        DEFAULT_P2P_DIRECT_GRACE_MS,
+        P2P_DIRECT_GRACE_MIN_MS,
+        P2P_DIRECT_GRACE_MAX_MS,
+    )
+}
+
 pub fn get_p2p_relay_commit_deadline_ms() -> u64 {
     normalize_option_u64(
         parse_option_u64(&get_local_option(keys::OPTION_P2P_RELAY_COMMIT_DEADLINE_MS)),
@@ -1374,6 +1569,15 @@ pub fn get_p2p_path_cache_ttl_sec() -> u64 {
         DEFAULT_P2P_PATH_CACHE_TTL_SEC,
         P2P_PATH_CACHE_TTL_MIN_SEC,
         P2P_PATH_CACHE_TTL_MAX_SEC,
+    )
+}
+
+pub fn get_p2p_circuit_break_failures() -> u64 {
+    normalize_option_u64(
+        parse_option_u64(&get_local_option(keys::OPTION_P2P_CIRCUIT_BREAK_FAILURES)),
+        DEFAULT_P2P_CIRCUIT_BREAK_FAILURES,
+        P2P_CIRCUIT_BREAK_FAILURES_MIN,
+        P2P_CIRCUIT_BREAK_FAILURES_MAX,
     )
 }
 
@@ -1421,7 +1625,12 @@ fn build_easy_sym_port_candidates_impl(
         return candidates;
     }
 
-    let step = (profile.mapped_port_span.max(1) as i64).clamp(1, 64);
+    let step = if profile.mapped_port_step > 0 {
+        profile.mapped_port_step as i64
+    } else {
+        profile.mapped_port_span.max(1) as i64
+    }
+    .clamp(1, 64);
     for idx in 1..=window {
         let predicted = base_port as i64 + direction * (idx as i64) * step;
         push_candidate_port(&mut candidates, predicted, max_candidates);
@@ -2555,16 +2764,20 @@ pub async fn test_ipv6() -> Option<tokio::task::JoinHandle<()>> {
     }))
 }
 
-pub async fn punch_udp(
+pub async fn punch_udp_with_constraints(
     socket: Arc<UdpSocket>,
     listen: bool,
+    max_time: Duration,
+    packet_budget: usize,
 ) -> ResultType<Option<bytes::BytesMut>> {
+    let packet_budget = packet_budget.max(1);
     let mut retry_interval = Duration::from_millis(20);
     const MAX_INTERVAL: Duration = Duration::from_millis(200);
-    const MAX_TIME: Duration = Duration::from_secs(20);
     let mut packets_sent = 0;
-    socket.send(&[]).await.ok();
-    packets_sent += 1;
+    if packets_sent < packet_budget {
+        socket.send(&[]).await.ok();
+        packets_sent += 1;
+    }
     let mut last_send_time = Instant::now();
     let tm = Instant::now();
     let mut data = [0u8; 1500];
@@ -2572,10 +2785,18 @@ pub async fn punch_udp(
     loop {
         tokio::select! {
             _ = hbb_common::sleep(retry_interval.as_secs_f32()) => {
-                if tm.elapsed() > MAX_TIME {
-                    bail!("UDP punch is timed out, stop sending packets after {:?} packets", packets_sent);
+                if tm.elapsed() > max_time {
+                    bail!(
+                        "UDP punch is timed out, stop sending packets after {:?} packets (budget={})",
+                        packets_sent,
+                        packet_budget
+                    );
                 }
                 let elapsed = last_send_time.elapsed();
+
+                if packets_sent >= packet_budget {
+                    continue;
+                }
 
                 if elapsed >= retry_interval {
                     socket.send(&[]).await.ok();
@@ -2604,6 +2825,13 @@ pub async fn punch_udp(
             }
         }
     }
+}
+
+pub async fn punch_udp(
+    socket: Arc<UdpSocket>,
+    listen: bool,
+) -> ResultType<Option<bytes::BytesMut>> {
+    punch_udp_with_constraints(socket, listen, Duration::from_secs(20), usize::MAX).await
 }
 
 fn test_ipv6_sync() {
@@ -2707,6 +2935,7 @@ mod tests {
             class_local: NatClassLocal::Cone,
             mapped_ip_count: 1,
             mapped_port_span: 0,
+            mapped_port_step: 0,
             mapping_varies_by_dest: false,
             port_trend: 0,
             port_stability: 1.0,
@@ -2720,6 +2949,7 @@ mod tests {
         assert_eq!(got.class_local, NatClassLocal::Cone);
         assert_eq!(got.mapped_ip_count, 1);
         assert_eq!(got.mapped_port_span, 0);
+        assert_eq!(got.mapped_port_step, 0);
         assert!(!got.mapping_varies_by_dest);
         assert_eq!(got.port_trend, 0);
         assert_eq!(got.port_stability, 1.0);
@@ -2752,21 +2982,87 @@ mod tests {
             confidence: 0.2,
             ..Default::default()
         };
-        assert_eq!(super::fold_nat_profile_to_nat_type(&low_conf), NatType::UNKNOWN_NAT);
+        assert_eq!(
+            super::fold_nat_profile_to_nat_type(&low_conf),
+            NatType::UNKNOWN_NAT
+        );
 
         let cone = NatProfile {
             class_local: NatClassLocal::Cone,
             confidence: 0.9,
             ..Default::default()
         };
-        assert_eq!(super::fold_nat_profile_to_nat_type(&cone), NatType::ASYMMETRIC);
+        assert_eq!(
+            super::fold_nat_profile_to_nat_type(&cone),
+            NatType::ASYMMETRIC
+        );
 
         let hard_sym = NatProfile {
             class_local: NatClassLocal::HardSym,
             confidence: 0.9,
             ..Default::default()
         };
-        assert_eq!(super::fold_nat_profile_to_nat_type(&hard_sym), NatType::SYMMETRIC);
+        assert_eq!(
+            super::fold_nat_profile_to_nat_type(&hard_sym),
+            NatType::SYMMETRIC
+        );
+
+        let mid_conf = NatProfile {
+            class_local: NatClassLocal::EasySymInc,
+            confidence: 0.45,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::fold_nat_profile_to_nat_type(&mid_conf),
+            NatType::UNKNOWN_NAT
+        );
+    }
+
+    #[test]
+    fn test_classify_nat_profile_from_ports_cone() {
+        let got = super::classify_nat_profile_from_ports(&[40000, 40000], &[40000, 40000], false)
+            .unwrap();
+        assert_eq!(got.0, NatType::ASYMMETRIC);
+        assert_eq!(got.1.class_local, NatClassLocal::Cone);
+        assert!(!got.1.mapping_varies_by_dest);
+    }
+
+    #[test]
+    fn test_classify_nat_profile_from_ports_easy_inc() {
+        let got = super::classify_nat_profile_from_ports(&[40000, 40002], &[40100, 40102], false)
+            .unwrap();
+        assert_eq!(got.0, NatType::ASYMMETRIC);
+        assert_eq!(got.1.class_local, NatClassLocal::EasySymInc);
+        assert_eq!(got.1.port_trend, 1);
+        assert_eq!(got.1.mapped_port_step, 2);
+        assert!(got.1.mapping_varies_by_dest);
+    }
+
+    #[test]
+    fn test_classify_nat_profile_from_ports_easy_dec() {
+        let got = super::classify_nat_profile_from_ports(&[45010, 45008], &[45110, 45108], false)
+            .unwrap();
+        assert_eq!(got.0, NatType::ASYMMETRIC);
+        assert_eq!(got.1.class_local, NatClassLocal::EasySymDec);
+        assert_eq!(got.1.port_trend, -1);
+        assert_eq!(got.1.mapped_port_step, 2);
+    }
+
+    #[test]
+    fn test_classify_nat_profile_from_ports_hard() {
+        let got = super::classify_nat_profile_from_ports(&[50000, 50040], &[50100, 50060], false)
+            .unwrap();
+        assert_eq!(got.0, NatType::SYMMETRIC);
+        assert_eq!(got.1.class_local, NatClassLocal::HardSym);
+    }
+
+    #[test]
+    fn test_classify_nat_profile_from_ports_insufficient_samples() {
+        let got =
+            super::classify_nat_profile_from_ports(&[40001], &[40101], false).unwrap();
+        assert_eq!(got.0, NatType::UNKNOWN_NAT);
+        assert_eq!(got.1.class_local, NatClassLocal::Unknown);
+        assert!(got.1.mapping_varies_by_dest);
     }
 
     #[test]
@@ -2774,6 +3070,7 @@ mod tests {
         let profile = NatProfile {
             class_local: NatClassLocal::EasySymInc,
             mapped_port_span: 2,
+            mapped_port_step: 2,
             confidence: 0.9,
             ..Default::default()
         };
@@ -2789,6 +3086,7 @@ mod tests {
         let profile = NatProfile {
             class_local: NatClassLocal::EasySymDec,
             mapped_port_span: 3,
+            mapped_port_step: 3,
             confidence: 0.95,
             ..Default::default()
         };
@@ -2803,11 +3101,27 @@ mod tests {
         let profile = NatProfile {
             class_local: NatClassLocal::EasySymInc,
             mapped_port_span: 5,
+            mapped_port_step: 5,
             confidence: 0.1,
             ..Default::default()
         };
         let got = super::build_easy_sym_port_candidates_impl(12345, &profile, 5, 8);
         assert_eq!(got, vec![12345]);
+    }
+
+    #[test]
+    fn test_build_easy_sym_port_candidates_use_step_over_span() {
+        let profile = NatProfile {
+            class_local: NatClassLocal::EasySymInc,
+            mapped_port_span: 20,
+            mapped_port_step: 2,
+            confidence: 0.9,
+            ..Default::default()
+        };
+        let got = super::build_easy_sym_port_candidates_impl(40000, &profile, 2, 8);
+        assert!(got.contains(&40002));
+        assert!(got.contains(&40004));
+        assert!(!got.contains(&40020));
     }
 
     #[test]
@@ -2859,7 +3173,10 @@ mod tests {
 
     #[test]
     fn test_normalize_udp_port_ready_window() {
-        assert_eq!(super::normalize_udp_port_ready_window(None, None), (250, 1200));
+        assert_eq!(
+            super::normalize_udp_port_ready_window(None, None),
+            (250, 1200)
+        );
         assert_eq!(
             super::normalize_udp_port_ready_window(Some(10), Some(9_999)),
             (50, 5000)

@@ -41,6 +41,7 @@ lazy_static::lazy_static! {
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
 static SENT_REGISTER_PK: AtomicBool = AtomicBool::new(false);
+const HARDSYM_FAST_FALLBACK_CONFIDENCE_THRESHOLD: f32 = 0.7;
 
 #[derive(Clone)]
 pub struct RendezvousMediator {
@@ -591,9 +592,18 @@ impl RendezvousMediator {
             .await;
         }
         let relay_server = self.get_relay_server(ph.relay_server);
-        // for ensure, websocket go relay directly
-        if ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC)
-            || Config::get_nat_type() == NatType::SYMMETRIC as i32
+        let peer_symmetric = ph.nat_type.enum_value() == Ok(NatType::SYMMETRIC);
+        // Fast relay only when both sides are very likely hard symmetric.
+        // Otherwise, keep direct attempt then fallback to relay.
+        let local_hard_symmetric =
+            if crate::get_p2p_nat_profile_v2_enabled() && !crate::is_nat_profile_expired(600) {
+                let profile = crate::get_nat_profile();
+                profile.class_local == crate::NatClassLocal::HardSym
+                    && profile.confidence >= HARDSYM_FAST_FALLBACK_CONFIDENCE_THRESHOLD
+            } else {
+                Config::get_nat_type() == NatType::SYMMETRIC as i32
+            };
+        if (peer_symmetric && local_hard_symmetric)
             || relay
             || (config::is_disable_tcp_listen() && ph.udp_port <= 0)
         {
