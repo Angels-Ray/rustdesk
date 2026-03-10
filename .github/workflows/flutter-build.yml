@@ -24,6 +24,9 @@ on:
       build-ios:
         type: boolean
         default: true
+      ios-signing:
+        type: boolean
+        default: false
       publish-release:
         type: boolean
         default: true
@@ -331,7 +334,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ inputs.build-ios && inputs.upload-artifact && env.IOS_P12_BASE64 != '' }}
+    if: ${{ inputs.build-ios && inputs.upload-artifact && inputs.ios-signing }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]

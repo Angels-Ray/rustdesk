@@ -19,4 +19,5 @@ jobs:
       build-android: true
       build-macos: false
       build-ios: false
+      ios-signing: false
       publish-release: false
