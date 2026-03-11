@@ -334,7 +334,7 @@ jobs:
             ./SignOutput/rustdesk-*.exe
 
   build-rustdesk-ios:
-    if: ${{ inputs.build-ios && inputs.upload-artifact && inputs.ios-signing }}
+    if: ${{ inputs.build-ios && inputs.upload-artifact && inputs.ios-signing && secrets.IOS_P12_BASE64 != '' }}
     name: build rustdesk ios ipa
     runs-on: ${{ matrix.job.os }}
     needs: [generate-bridge]
