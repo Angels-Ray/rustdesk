@@ -876,6 +876,7 @@ jobs:
           components: "rustfmt"
 
       - uses: Swatinem/rust-cache@v2
+        if: github.ref == 'refs/heads/master'
         with:
           prefix-key: rustdesk-lib-cache-android # TODO: drop '-android' part after caches are invalidated
           key: ${{ matrix.job.target }}
@@ -886,7 +887,7 @@ jobs:
           path: |
             ~/.gradle/caches
             ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('flutter/android/**/*.gradle*', 'flutter/android/gradle.properties', 'flutter/android/gradle/wrapper/gradle-wrapper.properties') }}-${{ matrix.job.target }}
+          key: ${{ runner.os }}-gradle-${{ hashFiles('flutter/android/**/*.gradle*', 'flutter/android/gradle.properties', 'flutter/android/gradle/wrapper/gradle-wrapper.properties') }}-universal
           restore-keys: |
             ${{ runner.os }}-gradle-${{ hashFiles('flutter/android/**/*.gradle*', 'flutter/android/gradle.properties', 'flutter/android/gradle/wrapper/gradle-wrapper.properties') }}-
             ${{ runner.os }}-gradle-
