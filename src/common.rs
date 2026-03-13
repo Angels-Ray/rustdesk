@@ -967,8 +967,29 @@ async fn test_nat_type_() -> ResultType<bool> {
     for _round in 0..2 {
         for i in 0..2 {
             let server = if i == 0 { &*server1 } else { &*server2 };
-            let mut socket =
-                socket_client::connect_tcp_local(server, local_addr, CONNECT_TIMEOUT).await?;
+            log::debug!(
+                "test nat: connect to {}, local_addr={:?}",
+                server,
+                local_addr
+            );
+            let mut socket = match socket_client::connect_tcp_local(
+                server,
+                local_addr,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            {
+                Ok(s) => s,
+                Err(err) => {
+                    log::error!(
+                        "test nat: connect failed to {}, local_addr={:?}, err={}",
+                        server,
+                        local_addr,
+                        err
+                    );
+                    return Err(err);
+                }
+            };
             if local_addr.is_none() {
                 // reuse the local addr is required for nat test
                 local_addr = Some(socket.local_addr());
@@ -977,7 +998,15 @@ async fn test_nat_type_() -> ResultType<bool> {
                     socket.local_addr().ip().to_string(),
                 );
             }
-            socket.send(&msg_out).await?;
+            if let Err(err) = socket.send(&msg_out).await {
+                log::error!(
+                    "test nat: send failed to {}, local_addr={:?}, err={}",
+                    server,
+                    socket.local_addr(),
+                    err
+                );
+                return Err(err);
+            }
             if let Some(msg_in) = get_next_nonkeyexchange_msg(&mut socket, None).await {
                 if let Some(rendezvous_message::Union::TestNatResponse(tnr)) = msg_in.union {
                     log::debug!("Got nat response from {}: port={}", server, tnr.port);
@@ -993,6 +1022,11 @@ async fn test_nat_type_() -> ResultType<bool> {
                     }
                 }
             } else {
+                log::warn!(
+                    "test nat: no response from {}, local_addr={:?}",
+                    server,
+                    socket.local_addr()
+                );
                 break;
             }
         }
@@ -2771,6 +2805,16 @@ pub async fn punch_udp_with_constraints(
     packet_budget: usize,
 ) -> ResultType<Option<bytes::BytesMut>> {
     let packet_budget = packet_budget.max(1);
+    let local_addr = socket.local_addr().ok();
+    let peer_addr = socket.peer_addr().ok();
+    log::info!(
+        "p2p udp punch start: local_addr={:?}, peer_addr={:?}, listen={}, max_time_ms={}, packet_budget={}",
+        local_addr,
+        peer_addr,
+        listen,
+        max_time.as_millis(),
+        packet_budget
+    );
     let mut retry_interval = Duration::from_millis(20);
     const MAX_INTERVAL: Duration = Duration::from_millis(200);
     let mut packets_sent = 0;
@@ -2787,9 +2831,11 @@ pub async fn punch_udp_with_constraints(
             _ = hbb_common::sleep(retry_interval.as_secs_f32()) => {
                 if tm.elapsed() > max_time {
                     bail!(
-                        "UDP punch is timed out, stop sending packets after {:?} packets (budget={})",
+                        "UDP punch is timed out, stop sending packets after {:?} packets (budget={}), local_addr={:?}, peer_addr={:?}",
                         packets_sent,
-                        packet_budget
+                        packet_budget,
+                        local_addr,
+                        peer_addr
                     );
                 }
                 let elapsed = last_send_time.elapsed();
@@ -2811,15 +2857,33 @@ pub async fn punch_udp_with_constraints(
                 }
             }
             res = socket.recv(&mut data) => match res {
-                Err(e) => bail!("UDP punch failed, {packets_sent} packets sent: {e}"),
+                Err(e) => bail!(
+                    "UDP punch failed, {packets_sent} packets sent, local_addr={:?}, peer_addr={:?}: {e}",
+                    local_addr,
+                    peer_addr
+                ),
                 Ok(n) => {
                     // log::debug!("UDP punch succeeded after sending {} packets after {:?}", packets_sent, tm.elapsed());
                     if listen {
                         if n == 0 {
                             continue;
                         }
+                        log::debug!(
+                            "UDP punch received {} bytes after {:?}, local_addr={:?}, peer_addr={:?}",
+                            n,
+                            tm.elapsed(),
+                            local_addr,
+                            peer_addr
+                        );
                         return Ok(Some(bytes::BytesMut::from(&data[..n])));
                     }
+                    log::debug!(
+                        "UDP punch received {} bytes after {:?}, local_addr={:?}, peer_addr={:?}",
+                        n,
+                        tm.elapsed(),
+                        local_addr,
+                        peer_addr
+                    );
                     return Ok(None);
                 }
             }

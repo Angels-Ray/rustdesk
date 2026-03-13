@@ -5326,7 +5326,12 @@ async fn test_udp_uat(
                 break;
             }
             _ = &mut stop_udp_rx => {
-                log::debug!("UDP NAT test received stop signal after {} packets", packets_sent);
+                log::debug!(
+                    "UDP NAT test received stop signal after {} packets, local_addr={:?}, rendezvous={}",
+                    packets_sent,
+                    local_addr,
+                    server_addr
+                );
                 break;
             }
             _ = hbb_common::sleep(retry_interval.as_secs_f32()) => {
@@ -5336,8 +5341,10 @@ async fn test_udp_uat(
                 if elapsed >= retry_interval {
                     if packets_sent >= udp_budget_packets {
                         log::debug!(
-                            "UDP NAT test packet budget reached: {} packets",
-                            udp_budget_packets
+                            "UDP NAT test packet budget reached: {} packets, local_addr={:?}, rendezvous={}",
+                            udp_budget_packets,
+                            local_addr,
+                            server_addr
                         );
                         break;
                     }
@@ -5356,18 +5363,27 @@ async fn test_udp_uat(
                     last_send_time = Instant::now();
                 }
             }
-            res = udp_socket.recv(&mut buf[..]) => {
+            res = udp_socket.recv_from(&mut buf[..]) => {
                 match res {
-                    Ok(n) => {
+                    Ok((n, from_addr)) => {
                         match RendezvousMessage::parse_from_bytes(&buf[0..n]) {
                             Ok(msg_in) => {
                                 if let Some(rendezvous_message::Union::TestNatResponse(response)) = msg_in.union {
                                     *udp_port.lock().unwrap() = response.port as u16;
+                                    log::debug!(
+                                        "UDP NAT test received response from {} (reported port={})",
+                                        from_addr,
+                                        response.port
+                                    );
                                     break;
                                 }
                             }
                             Err(e) => {
-                                log::warn!("Failed to parse UDP NAT test response: {}", e);
+                                log::warn!(
+                                    "Failed to parse UDP NAT test response from {}: {}",
+                                    from_addr,
+                                    e
+                                );
                             }
                         }
                     }
@@ -5422,15 +5438,33 @@ async fn udp_nat_connect_with_reserved_budget(
     )
         .await
         .map_err(|err| {
-            log::debug!("{err}");
+            log::debug!(
+                "p2p udp direct punch failed: typ={}, peer_addr={:?}, local_addr={:?}, err={}",
+                typ,
+                peer_addr,
+                local_addr,
+                err
+            );
             anyhow!(err)
         })?;
     let res = KcpStream::connect(socket, Duration::from_millis(ms_timeout))
         .await
         .map_err(|err| {
-            log::debug!("Failed to connect KCP stream: {}", err);
+            log::debug!(
+                "Failed to connect KCP stream: typ={}, peer_addr={:?}, local_addr={:?}, err={}",
+                typ,
+                peer_addr,
+                local_addr,
+                err
+            );
             anyhow!(err)
         })?;
+    log::info!(
+        "p2p udp direct success: typ={}, peer_addr={:?}, local_addr={:?}",
+        typ,
+        peer_addr,
+        local_addr
+    );
     Ok((res.1, Some(res.0), typ))
 }
 

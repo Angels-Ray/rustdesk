@@ -210,11 +210,15 @@ impl RendezvousMediator {
             select! {
                 n = socket.next() => {
                     match n {
-                        Some(Ok((bytes, _))) => {
+                        Some(Ok((bytes, from))) => {
                             if let Ok(msg) = Message::parse_from_bytes(&bytes) {
                                 rz.handle_resp(msg.union, Sink::Framed(&mut socket, &addr), &server, &mut update_latency).await?;
                             } else {
-                                log::debug!("Non-protobuf message bytes received: {:?}", bytes);
+                                log::debug!(
+                                    "Non-protobuf message bytes received from {:?}, len={}",
+                                    from,
+                                    bytes.len()
+                                );
                             }
                         },
                         Some(Err(e)) => bail!("Failed to receive next: {}", e),  // maybe socks5 tcp disconnected
@@ -335,7 +339,9 @@ impl RendezvousMediator {
                     Self::restart();
                 }
             }
-            _ => {}
+            _ => {
+                log::debug!("Unhandled rendezvous response from {}", self.host);
+            }
         }
         Ok(())
     }
@@ -933,8 +939,20 @@ async fn start_ipv6(
         );
         let socket_cloned = socket.clone();
         let func = async {
-            socket.connect(peer_addr).await?;
-            let res = crate::punch_udp(socket.clone(), true).await?;
+            if let Err(e) = socket.connect(peer_addr).await {
+                return Err(anyhow::anyhow!(
+                    "UDP connect failed: local_addr={:?}, peer_addr={}: {e}",
+                    socket.local_addr().ok(),
+                    peer_addr
+                ));
+            }
+            let res = crate::punch_udp(socket.clone(), true).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "UDP punch failed: local_addr={:?}, peer_addr={}: {e}",
+                    socket.local_addr().ok(),
+                    peer_addr
+                )
+            })?;
             let stream = crate::kcp_stream::KcpStream::accept(
                 socket,
                 Duration::from_millis(CONNECT_TIMEOUT as _),
