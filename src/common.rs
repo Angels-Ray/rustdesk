@@ -1344,10 +1344,10 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
         }
         Err(err) => {
             if is_tls_not_cached && err.is_request() {
-                let tls_type = TlsType::NativeTls;
-                let client = create_http_client_async(tls_type, false);
+                let tls_type = TlsType::Rustls;
+                let client = create_http_client_async(tls_type, true);
                 let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
+                upsert_tls_cache(tls_url, tls_type, true);
                 resp
             } else {
                 return Err(err.into());
@@ -1803,17 +1803,11 @@ async fn post_request_(
                         )
                         .await
                     } else {
-                        log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
-                        post_request_(
-                            url,
-                            tls_url,
-                            body,
-                            header,
-                            Some(TlsType::NativeTls),
-                            original_danger_accept_invalid_cert,
-                            original_danger_accept_invalid_cert,
-                        )
-                        .await
+                        log::warn!(
+                            "HTTP request failed: {:?}, rustls-only build, no native-tls fallback",
+                            e
+                        );
+                        Err(anyhow!("{:?}", e))
                     }
                 } else {
                     Err(anyhow!("{:?}", e))
@@ -1916,18 +1910,11 @@ async fn get_http_response_async(
                         )
                         .await
                     } else {
-                        log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
-                        get_http_response_async(
-                            url,
-                            tls_url,
-                            method,
-                            body,
-                            header,
-                            Some(TlsType::NativeTls),
-                            original_danger_accept_invalid_cert,
-                            original_danger_accept_invalid_cert,
-                        )
-                        .await
+                        log::warn!(
+                            "HTTP request failed: {:?}, rustls-only build, no native-tls fallback",
+                            e
+                        );
+                        Err(anyhow!("{:?}", e))
                     }
                 } else {
                     Err(anyhow!("{:?}", e))
